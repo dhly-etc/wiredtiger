@@ -588,13 +588,27 @@ struct __wt_name_flag {
 };
 
 /*
- * WT_LAYERED_DRAIN_ENTRY --
- *	Queue entry for layered table drain threads. Holds a pinned ingest btree dhandle
- *	(via session_inuse) so the dhandle stays open while the work item is processed.
+ * WT_LAYERED_DRAIN_TABLE_STATE --
+ *	Shared per-table state for parallel ingest drain. All work items for the same table point to
+ *	one instance. The last range to finish (pending decrements to 0) performs table-level cleanup.
  */
-struct __wt_layered_drain_entry {
-    WT_DATA_HANDLE *ingest_dhandle;
-    TAILQ_ENTRY(__wt_layered_drain_entry) q;
+struct __wt_layered_drain_table_state {
+    WT_DATA_HANDLE *ingest_dhandle; /* Pinned once per table; released when pending reaches 0. */
+    uint32_t pending; /* Atomic: number of key-range work items not yet complete. */
+    uint32_t error;   /* First error from any range worker (stored via CAS, 0 = no error). */
+};
+
+/*
+ * WT_LAYERED_DRAIN_WORK_ITEM --
+ *	Queue entry for layered table drain threads. Each item covers one key range of one table.
+ *	key_start and key_stop delimit an inclusive-lower / exclusive-upper range; size == 0 means
+ *	unbounded at that end.
+ */
+struct __wt_layered_drain_work_item {
+    WT_ITEM key_start;
+    WT_ITEM key_stop;
+    struct __wt_layered_drain_table_state *table_state;
+    TAILQ_ENTRY(__wt_layered_drain_work_item) q;
 };
 
 /*
@@ -1025,7 +1039,7 @@ struct __wt_connection_impl {
     struct __wt_layered_drain_data {
         WT_THREAD_GROUP threads;
         WT_SPINLOCK queue_lock;
-        TAILQ_HEAD(__wt_layered_drain_qh, __wt_layered_drain_entry) work_queue;
+        TAILQ_HEAD(__wt_layered_drain_qh, __wt_layered_drain_work_item) work_queue;
         bool running;
         uint32_t thread_count;
     } layered_drain_data;

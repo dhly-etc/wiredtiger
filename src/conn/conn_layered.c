@@ -1360,6 +1360,39 @@ err:
 }
 
 /*
+ * __disagg_mark_btrees_writable_on_step_up --
+ *     Clear the readonly flag on all disaggregated btrees. This must be called during follower
+ *     step-up, so that writes to the stable tables during drain (and afterwards) are permitted.
+ */
+static void
+__disagg_mark_btrees_writable_on_step_up(WT_SESSION_IMPL *session)
+{
+    WT_BTREE *btree;
+    WT_CONNECTION_IMPL *conn;
+    WT_DATA_HANDLE *dhandle;
+
+    conn = S2C(session);
+
+    for (dhandle = NULL;;) {
+        WT_DHANDLE_NEXT(session, dhandle, &conn->dhqh, q);
+        if (dhandle == NULL)
+            break;
+
+        /* Only care about open disaggregated btree dhandles. */
+        if (!WT_DHANDLE_BTREE(dhandle) || !F_ISSET(dhandle, WT_DHANDLE_OPEN))
+            continue;
+
+        btree = (WT_BTREE *)dhandle->handle;
+
+        if (!F_ISSET(btree, WT_BTREE_DISAGGREGATED) || !F_ISSET(btree, WT_BTREE_READONLY))
+            continue;
+
+        /* Clear the readonly flag so writes to the stable tables are permitted. */
+        F_CLR(btree, WT_BTREE_READONLY);
+    }
+}
+
+/*
  * __disagg_step_up --
  *     Step up to the node to the leader mode.
  */
@@ -1395,6 +1428,14 @@ __disagg_step_up(WT_SESSION_IMPL *session)
      */
     conn->layered_table_manager.leader = true;
     WT_STAT_CONN_SET(session, disagg_role_leader, 1);
+
+    /*
+     * Clear the readonly flag on all disaggregated btrees. During step-down, all disaggregated
+     * btrees were marked readonly to prevent writes on a follower. Now that we are stepping up to
+     * leader, we must clear that flag so that drain can write to the stable tables and so that
+     * normal leader writes (and checkpoints) are permitted afterward.
+     */
+    WT_WITH_HANDLE_LIST_READ_LOCK(session, __disagg_mark_btrees_writable_on_step_up(session));
 
     /*
      * Abandon the current checkpoint if it is incomplete, and begin a new one. We need to do this
