@@ -1361,8 +1361,11 @@ err:
 
 /*
  * __disagg_mark_btrees_writable_on_step_up --
- *     Clear the readonly flag on all disaggregated btrees. This must be called during follower
+ *     Clear the readonly flag on stable disaggregated btrees. This must be called during follower
  *     step-up, so that writes to the stable tables during drain (and afterwards) are permitted.
+ *     Ingest btrees are intentionally skipped: their reconciliation path cannot handle tombstones
+ *     with no on-disk value (valid for ingest), so eviction must stay blocked there until after
+ *     drain empties them.
  */
 static void
 __disagg_mark_btrees_writable_on_step_up(WT_SESSION_IMPL *session)
@@ -1385,6 +1388,10 @@ __disagg_mark_btrees_writable_on_step_up(WT_SESSION_IMPL *session)
         btree = (WT_BTREE *)dhandle->handle;
 
         if (!F_ISSET(btree, WT_BTREE_DISAGGREGATED) || !F_ISSET(btree, WT_BTREE_READONLY))
+            continue;
+
+        /* Ingest btrees must stay read-only until drain empties them. */
+        if (WT_URI_IS_INGEST(dhandle->name))
             continue;
 
         /* Clear the readonly flag so writes to the stable tables are permitted. */
