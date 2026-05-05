@@ -477,5 +477,106 @@ class test_layered106(wttest.WiredTigerTestCase):
         read_cursor.close()
         read_session.close()
 
+    # -----------------------------------------------------------------------
+    # Test 8: Standalone ingest tombstone eviction.
+    #
+    # A "standalone" tombstone arises when a document was inserted before oplog
+    # application began on this node -- so the document's insert lives only in
+    # the stable btree -- and is subsequently deleted on the follower.  The
+    # ingest btree then holds a tombstone with NO backing on-disk value.
+    #
+    # This exercises the guard added in rec_visibility.c that allows the
+    # reconciler to evict such a page without asserting "No on-disk value is
+    # found".  It also verifies that after step-up and drain the delete is
+    # reflected in the stable table.
+    #
+    # Timeline:
+    #   ts=10 : leader inserts 'key_to_delete' -> stable btree
+    #   stable_timestamp=10, checkpoint
+    #   [reconfigure to follower]
+    #   ts=20 : follower deletes 'key_to_delete' -> tombstone in ingest only
+    #   ts=21 : follower inserts 'key_sentinel'  -> ingest (same page)
+    #   force eviction of the ingest page          -> exercises rec_visibility.c fix
+    #   [reconfigure to leader -- drain runs]
+    #   verify 'key_to_delete' absent, 'key_sentinel' present
+    # -----------------------------------------------------------------------
+
+    def test_drain_standalone_ingest_tombstone(self):
+        uri = 'layered:test_layered106_tombstone'
+        ingest_uri = 'file:test_layered106_tombstone.wt_ingest'
+
+        # Leader: insert key_to_delete so it lives in the stable btree only.
+        self.session.create(uri, 'key_format=S,value_format=S')
+        cursor = self.session.open_cursor(uri)
+        self.session.begin_transaction()
+        cursor.set_key('key_to_delete')
+        cursor.set_value('original_value')
+        cursor.insert()
+        self.session.commit_transaction(f'commit_timestamp={self.timestamp_str(10)}')
+        cursor.close()
+
+        self.conn.set_timestamp(f'stable_timestamp={self.timestamp_str(10)}')
+        self.session.checkpoint()
+
+        # Reconfigure to follower -- subsequent writes go to the ingest btree.
+        self.conn.reconfigure('disaggregated=(role="follower")')
+
+        follower_session = self.conn.open_session('')
+        follower_cursor = follower_session.open_cursor(uri)
+
+        # Delete key_to_delete: tombstone lands in ingest with no backing insert
+        # in the ingest btree (the only insert is in stable from above).
+        follower_session.begin_transaction()
+        follower_cursor.set_key('key_to_delete')
+        follower_cursor.remove()
+        follower_session.commit_transaction(
+            f'commit_timestamp={self.timestamp_str(20)}')
+
+        # Insert a sentinel key so the ingest page has a non-tombstone update
+        # that an eviction cursor can search for to position on the same page.
+        follower_session.begin_transaction()
+        follower_cursor.set_key('key_sentinel')
+        follower_cursor.set_value('sentinel_value')
+        follower_cursor.insert()
+        follower_session.commit_transaction(
+            f'commit_timestamp={self.timestamp_str(21)}')
+        follower_cursor.close()
+
+        self.conn.set_timestamp(f'stable_timestamp={self.timestamp_str(21)}')
+
+        # Force eviction of the ingest btree page.  The page holds a tombstone
+        # for key_to_delete with no on-disk backing -- this is the code path
+        # guarded by the WT_URI_IS_INGEST check in rec_visibility.c.
+        evict_session = self.conn.open_session('debug=(release_evict_page)')
+        evict_cursor = evict_session.open_cursor(ingest_uri)
+        evict_cursor.set_key('key_sentinel')
+        evict_cursor.search()  # positions on the page that also holds the tombstone
+        evict_cursor.close()   # triggers eviction of the page
+        evict_session.close()
+
+        # Step up -- drain copies both the tombstone and the sentinel to stable.
+        self.conn.reconfigure('disaggregated=(role="leader")')
+
+        follower_session.checkpoint()
+
+        # Verify: key_to_delete absent (tombstone drained), key_sentinel present.
+        read_session = self.conn.open_session('')
+        read_cursor = read_session.open_cursor(uri)
+
+        read_session.begin_transaction(f'read_timestamp={self.timestamp_str(21)}')
+
+        read_cursor.set_key('key_to_delete')
+        self.assertEqual(read_cursor.search(), wiredtiger.WT_NOTFOUND,
+                         'key_to_delete should be absent after tombstone drain')
+
+        read_cursor.set_key('key_sentinel')
+        self.assertEqual(read_cursor.search(), 0,
+                         'key_sentinel should be present after drain')
+        self.assertEqual(read_cursor.get_value(), 'sentinel_value')
+
+        read_session.rollback_transaction()
+        read_cursor.close()
+        read_session.close()
+
 if __name__ == '__main__':
     wttest.run()

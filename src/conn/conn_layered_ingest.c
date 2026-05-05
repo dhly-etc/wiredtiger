@@ -29,10 +29,23 @@ __layered_assert_stable_btree_state(
             return;
         /* No on-page value to check; rely solely on visibility. */
         has_value = false;
+    else if (cbt->ins != NULL) {
+        /*
+         * The key was found via the insert list rather than the on-page binary-search array.
+         * This is legitimate when the stable btree page was reconciled during the leader's last
+         * checkpoint but not yet evicted: in-memory WT_INSERT nodes survive reconciliation until
+         * the page is evicted. Derive has_value by scanning the insert's update chain for any
+         * committed non-tombstone update.
+         */
+        WT_UPDATE *ins_upd;
+        has_value = false;
+        for (ins_upd = cbt->ins->upd; ins_upd != NULL; ins_upd = ins_upd->next)
+            if (ins_upd->txnid != WT_TXN_ABORTED && ins_upd->type != WT_UPDATE_TOMBSTONE) {
+                has_value = true;
+                break;
+            }
     } else {
-        WT_ASSERT_ALWAYS(session, cbt->ins == NULL,
-          "The stable btree should not contain inserts prior to draining");
-
+        WT_UPDATE *upd = NULL;
         if (cbt->ref->page->modify != NULL && cbt->ref->page->modify->mod_row_update != NULL)
             upd = cbt->ref->page->modify->mod_row_update[cbt->slot];
         else
