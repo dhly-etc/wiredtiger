@@ -1365,6 +1365,19 @@ __rec_fill_tw_from_upd_select(WT_SESSION_IMPL *session, WT_PAGE *page, WT_CELL_U
     } else if (select_tw->stop_ts != WT_TS_NONE || select_tw->stop_txn != WT_TXN_NONE) {
         WT_ASSERT_ALWAYS(
           session, tombstone != NULL, "The only contents of the update list is a single tombstone");
+
+        /*
+         * On an ingest btree a standalone tombstone may have no backing on-disk value: the document
+         * may have been inserted before oplog application began on this node, so its backing value
+         * lives in the stable btree rather than in the ingest btree. Preserve the tombstone as the
+         * selected update so that drain can copy it to the stable table. Skip the normal
+         * append-original-value path, which only applies where an on-disk backing value exists.
+         */
+        if (WT_URI_IS_INGEST(S2BT(session)->dhandle->name) && !WT_REC_HAS_ON_DISK(vpack)) {
+            upd_select->upd = tombstone;
+            return (0);
+        }
+
         WT_ASSERT_ALWAYS(session, WT_REC_HAS_ON_DISK(vpack), "No on-disk value is found");
 
         /* Move the pointer to the last update on the update chain. */
