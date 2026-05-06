@@ -451,7 +451,7 @@ err:
  */
 static int
 __layered_copy_ingest_table(WT_SESSION_IMPL *session, const char *ingest_uri,
-  const WT_ITEM *key_start, const WT_ITEM *key_stop)
+  const WT_ITEM *key_start, const WT_ITEM *key_stop, uint64_t *nkeysp)
 {
     WT_BTREE *ingest_btree, *stable_btree;
     WT_CURSOR *ingest_btree_cursor, *ingest_version_cursor, *prepare_cursor, *stable_cursor;
@@ -479,6 +479,7 @@ __layered_copy_ingest_table(WT_SESSION_IMPL *session, const char *ingest_uri,
     last_upd = prev_upd = upd = upds = NULL;
     prepare_resolved = prepare_txn_fixed = skip_first_next = false;
     preserve_prepared = F_ISSET(S2C(session), WT_CONN_PRESERVE_PREPARED);
+    *nkeysp = 0;
 
     WT_RET(__wt_scr_alloc(session, 0, &stable_uri_buf));
     WT_ERR(__layered_derive_stable_uri(session, ingest_uri, stable_uri_buf));
@@ -542,6 +543,7 @@ __layered_copy_ingest_table(WT_SESSION_IMPL *session, const char *ingest_uri,
                 WT_WITH_DHANDLE(session, cbt->dhandle,
                   ret = __layered_move_updates(session, cbt, key, upds, last_upd, from_ts));
                 WT_ERR(ret);
+                ++(*nkeysp);
                 upds = NULL;
             } else
                 ret = 0;
@@ -562,6 +564,7 @@ __layered_copy_ingest_table(WT_SESSION_IMPL *session, const char *ingest_uri,
                     WT_WITH_DHANDLE(session, cbt->dhandle,
                       ret = __layered_move_updates(session, cbt, key, upds, last_upd));
                     WT_ERR(ret);
+                    ++(*nkeysp);
                     upds = NULL;
                 }
                 goto err;
@@ -580,6 +583,7 @@ __layered_copy_ingest_table(WT_SESSION_IMPL *session, const char *ingest_uri,
                 WT_WITH_DHANDLE(session, cbt->dhandle,
                   ret = __layered_move_updates(session, cbt, key, upds, last_upd, from_ts));
                 WT_ERR(ret);
+                ++(*nkeysp);
             }
 
             upds = NULL;
@@ -732,6 +736,34 @@ err:
     return (ret);
 }
 
+/* Buffer large enough for 255 bytes of key as hex plus NUL. */
+#define WT_LAYERED_KEY_HEX_BUFSIZE 512
+
+/*
+ * __layered_key_hex --
+ *     Write the full hex encoding of a key bound into buf for logging.
+ *     A zero-size item (unbounded range end) is rendered as "(none)".
+ */
+static void
+__layered_key_hex(const WT_ITEM *key, char *buf, size_t bufsize)
+{
+    static const char hex[] = "0123456789abcdef";
+    const uint8_t *data;
+    size_t i, pos;
+
+    if (key->size == 0) {
+        (void)snprintf(buf, bufsize, "(none)");
+        return;
+    }
+
+    data = (const uint8_t *)key->data;
+    for (i = 0, pos = 0; i < key->size && pos + 2 < bufsize; i++) {
+        buf[pos++] = hex[(data[i] >> 4) & 0xf];
+        buf[pos++] = hex[data[i] & 0xf];
+    }
+    buf[pos] = '\0';
+}
+
 /*
  * __truncate_cmp_by_start_ts --
  *     qsort comparator: ascending order by truncate start timestamp and txn id.
@@ -869,10 +901,13 @@ __layered_drain_worker_run(WT_SESSION_IMPL *session, WT_THREAD *ctx)
     WT_DECL_RET;
     WT_LAYERED_DRAIN_TABLE_STATE *ts;
     WT_LAYERED_DRAIN_WORK_ITEM *work_item;
+    char start_preview[WT_LAYERED_KEY_HEX_BUFSIZE], stop_preview[WT_LAYERED_KEY_HEX_BUFSIZE];
+    uint64_t nkeys;
     const char *ingest_uri;
 
     conn = S2C(session);
     WT_UNUSED(ctx);
+    nkeys = 0;
 
     __wt_spin_lock(session, &conn->layered_drain_data.queue_lock);
     if (TAILQ_EMPTY(&conn->layered_drain_data.work_queue)) {
@@ -887,18 +922,30 @@ __layered_drain_worker_run(WT_SESSION_IMPL *session, WT_THREAD *ctx)
     ts = work_item->table_state;
     ingest_uri = ts->ingest_dhandle->name;
 
+    __layered_key_hex(&work_item->key_start, start_preview, sizeof(start_preview));
+    __layered_key_hex(&work_item->key_stop, stop_preview, sizeof(stop_preview));
+    __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
+      "Drain range begin: table=%s range=%" PRIu32 "/%" PRIu32 " start=%s stop=%s",
+      ingest_uri, work_item->range_index, ts->total_ranges, start_preview, stop_preview);
+
     /* Skip copy if a prior range for this table already failed. */
     if (__wt_atomic_load_uint32_relaxed(&ts->error) == 0) {
         ret = __layered_copy_ingest_table(session, ingest_uri,
           work_item->key_start.size > 0 ? &work_item->key_start : NULL,
-          work_item->key_stop.size > 0 ? &work_item->key_stop : NULL);
+          work_item->key_stop.size > 0 ? &work_item->key_stop : NULL, &nkeys);
         if (ret != 0) {
             __wt_err(session, ret, "Failed to copy range of ingest table \"%s\" to stable",
               ingest_uri);
             /* Record the first error via CAS; later failures are suppressed. */
             (void)__wt_atomic_cas_uint32_v(&ts->error, 0, (uint32_t)ret);
-        }
+        } else
+            (void)__wt_atomic_add_uint64(&conn->layered_drain_data.total_keys_drained, nkeys);
     }
+
+    __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
+      "Drain range finish: table=%s range=%" PRIu32 "/%" PRIu32 " keys=%" PRIu64 "%s",
+      ingest_uri, work_item->range_index, ts->total_ranges, nkeys,
+      ret != 0 ? " (error)" : "");
 
     /* When all ranges for this table finish, perform table-level cleanup. */
     if (__wt_atomic_sub_uint32(&ts->pending, 1) == 0) {
@@ -1093,7 +1140,9 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
     WT_LAYERED_DRAIN_WORK_ITEM *work_item;
     WT_LAYERED_TABLE_MANAGER *manager;
     WT_LAYERED_TABLE_MANAGER_ENTRY **entries;
-    size_t i, j, table_count;
+    int64_t bytes_before, bytes_after;
+    bytes_before = bytes_after = 0;
+    size_t i, j, table_count, tables_drained;
     uint32_t actual_splits, total_items;
     bool empty, group_created, queue_initialized;
 
@@ -1105,6 +1154,7 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
     work_item = NULL;
     actual_splits = 0;
     total_items = 0;
+    tables_drained = 0;
     group_created = false;
     queue_initialized = false;
 
@@ -1127,6 +1177,9 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
     if (table_count > 0)
         WT_ERR(__wt_calloc_def(session, table_count, &table_states));
 
+    bytes_before = WT_STAT_CONN_READ(conn->stats, block_byte_read);
+    __wt_atomic_store_uint64(&conn->layered_drain_data.total_keys_drained, 0);
+
     /* Initialize the work queue before spawning any threads. */
     TAILQ_INIT(&conn->layered_drain_data.work_queue);
     WT_ERR(__wt_spin_init(
@@ -1147,6 +1200,7 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
         WT_ERR(__layered_ingest_table_is_empty(session, e->ingest_uri, &empty));
         if (empty)
             continue;
+        ++tables_drained;
 
         /* Sample the ingest table to determine range split points. */
         actual_splits = 0;
@@ -1158,6 +1212,7 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
         /* Allocate per-table state; pending starts at the number of ranges. */
         WT_ERR(__wt_calloc_one(session, &ts));
         ts->pending = actual_splits + 1;
+        ts->total_ranges = actual_splits + 1;
         ts->error = 0;
         table_states[i] = ts;
 
@@ -1184,6 +1239,7 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
         for (j = 0; j <= (size_t)actual_splits; j++) {
             WT_ERR(__wt_calloc_one(session, &work_item));
             work_item->table_state = ts;
+            work_item->range_index = (uint32_t)j;
 
             if (j > 0)
                 WT_ERR(__wt_buf_set(
@@ -1191,6 +1247,18 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
             if (j < (size_t)actual_splits)
                 WT_ERR(__wt_buf_set(
                   session, &work_item->key_stop, split_keys[j].data, split_keys[j].size));
+
+            {
+                char start_preview[WT_LAYERED_KEY_HEX_BUFSIZE];
+                char stop_preview[WT_LAYERED_KEY_HEX_BUFSIZE];
+                __layered_key_hex(&work_item->key_start, start_preview,
+                  sizeof(start_preview));
+                __layered_key_hex(&work_item->key_stop, stop_preview,
+                  sizeof(stop_preview));
+                __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
+                  "Drain range queued: table=%s range=%" PRIu32 "/%" PRIu32 " start=%s stop=%s",
+                  e->ingest_uri, (uint32_t)j, ts->total_ranges, start_preview, stop_preview);
+            }
 
             __wt_spin_lock(session, &conn->layered_drain_data.queue_lock);
             TAILQ_INSERT_TAIL(&conn->layered_drain_data.work_queue, work_item, q);
@@ -1249,6 +1317,13 @@ err:
         __wt_writelock(session, &conn->layered_drain_data.threads.lock);
         WT_TRET(__wt_thread_group_destroy(session, &conn->layered_drain_data.threads));
     }
+    bytes_after = WT_STAT_CONN_READ(conn->stats, block_byte_read);
+    __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
+      "Drain complete: %" WT_SIZET_FMT " table(s) %" PRIu32 " work item(s)"
+      " keys=%" PRIu64 " block_bytes_read=%" PRId64,
+      tables_drained, total_items,
+      __wt_atomic_load_uint64(&conn->layered_drain_data.total_keys_drained),
+      bytes_after - bytes_before);
     if (queue_initialized)
         __layered_drain_clear_work_queue(session);
     /*

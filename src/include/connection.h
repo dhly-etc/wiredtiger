@@ -594,8 +594,9 @@ struct __wt_name_flag {
  */
 struct __wt_layered_drain_table_state {
     WT_DATA_HANDLE *ingest_dhandle; /* Pinned once per table; released when pending reaches 0. */
-    uint32_t pending; /* Atomic: number of key-range work items not yet complete. */
-    uint32_t error;   /* First error from any range worker (stored via CAS, 0 = no error). */
+    uint32_t pending;      /* Atomic: number of key-range work items not yet complete. */
+    uint32_t total_ranges; /* Total work items queued for this table (set once, read-only). */
+    uint32_t error;        /* First error from any range worker (stored via CAS, 0 = no error). */
 };
 
 /*
@@ -608,6 +609,7 @@ struct __wt_layered_drain_work_item {
     WT_ITEM key_start;
     WT_ITEM key_stop;
     struct __wt_layered_drain_table_state *table_state;
+    uint32_t range_index; /* Zero-based index of this range within its table (for logging). */
     TAILQ_ENTRY(__wt_layered_drain_work_item) q;
 };
 
@@ -1042,6 +1044,7 @@ struct __wt_connection_impl {
         TAILQ_HEAD(__wt_layered_drain_qh, __wt_layered_drain_work_item) work_queue;
         bool running;
         uint32_t thread_count;
+        uint64_t total_keys_drained; /* Atomic: cumulative keys moved across all ranges/tables. */
     } layered_drain_data;
 
     WT_DISAGGREGATED_STORAGE disaggregated_storage;
