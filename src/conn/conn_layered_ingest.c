@@ -982,13 +982,6 @@ __layered_drain_worker_check(WT_SESSION_IMPL *session)
 }
 
 /*
- * WT_LAYERED_DRAIN_MIN_RANGE_SIZE --
- *     Minimum number of keys per drain range. Tables with fewer keys than two times this threshold
- *     are drained as a single work item without range subdivision.
- */
-#define WT_LAYERED_DRAIN_MIN_RANGE_SIZE 1000
-
-/*
  * __layered_ingest_table_is_empty --
  *     Return true if the ingest table has no records.
  */
@@ -1019,81 +1012,119 @@ err:
 }
 
 /*
+ * __layered_key_cmp --
+ *     Lexicographic comparator for WT_ITEM keys; suitable as a qsort callback.
+ */
+static int
+__layered_key_cmp(const void *a, const void *b)
+{
+    const WT_ITEM *ka, *kb;
+    size_t min_len;
+    int cmp;
+
+    ka = (const WT_ITEM *)a;
+    kb = (const WT_ITEM *)b;
+    min_len = WT_MIN(ka->size, kb->size);
+    if (min_len > 0 && (cmp = memcmp(ka->data, kb->data, min_len)) != 0)
+        return (cmp);
+    return (ka->size < kb->size ? -1 : ka->size > kb->size ? 1 : 0);
+}
+
+/*
  * __layered_sample_ingest_keys --
- *     Scan the ingest table and return up to (num_ranges - 1) evenly-spaced split keys. Each split
- *     key is the first key of a new range; the caller owns the returned array and must free it with
- *     __wt_buf_free / __wt_free. Returns actual_splitsp == 0 when the table is too small to
- *     subdivide.
+ *     Sample the ingest table with a random cursor and return up to (num_ranges - 1) split keys
+ *     that divide the key space into roughly equal ranges. Uses oversampling (num_ranges^2 random
+ *     draws), sorts them, then selects evenly spaced entries as split boundaries. The caller owns
+ *     the returned array and must free it with __wt_buf_free / __wt_free. Returns actual_splitsp
+ *     == 0 when the table is too small to subdivide. sampled_keysp receives the number of samples
+ *     drawn, useful as a proxy for table size in diagnostic logging.
  */
 static int
 __layered_sample_ingest_keys(WT_SESSION_IMPL *session, const char *ingest_uri, uint32_t num_ranges,
-  WT_ITEM **split_keysp, uint32_t *actual_splitsp)
+  WT_ITEM **split_keysp, uint32_t *actual_splitsp, uint64_t *sampled_keysp)
 {
     WT_CURSOR *cursor;
     WT_DECL_ITEM(tmp_key);
     WT_DECL_RET;
-    WT_ITEM *split_keys;
-    uint32_t max_splits;
-    uint64_t key_count;
-    size_t n_collected;
-    const char *raw_cfg[] = {WT_CONFIG_BASE(session, WT_SESSION_open_cursor), "raw", NULL};
+    WT_ITEM *samples, *split_keys;
+    uint32_t i, idx, max_splits, n_collected, n_splits, num_samples;
+    const char *rnd_cfg[] = {WT_CONFIG_BASE(session, WT_SESSION_open_cursor),
+      "raw,next_random=true", NULL};
 
     cursor = NULL;
+    samples = NULL;
     split_keys = NULL;
+    idx = 0;
     *split_keysp = NULL;
     *actual_splitsp = 0;
+    *sampled_keysp = 0;
 
     if (num_ranges <= 1)
         return (0);
 
     max_splits = num_ranges - 1;
+    /* Oversample by a factor of num_ranges, capped to bound memory use. */
+    num_samples = WT_MIN(num_ranges * num_ranges, 4096);
 
     WT_ERR(__wt_scr_alloc(session, 0, &tmp_key));
-    WT_ERR(__wt_open_cursor(session, ingest_uri, NULL, raw_cfg, &cursor));
-    WT_ERR(__wt_calloc_def(session, max_splits, &split_keys));
+    WT_ERR(__wt_open_cursor(session, ingest_uri, NULL, rnd_cfg, &cursor));
+    WT_ERR(__wt_calloc_def(session, num_samples, &samples));
 
-    key_count = 0;
     n_collected = 0;
     /* Set WT_TXN_IGNORE_PREPARE so prepared updates don't cause WT_PREPARE_CONFLICT. */
     F_SET(session->txn, WT_TXN_IGNORE_PREPARE);
-    for (;;) {
-        WT_WITH_TXN_ISOLATION(session, WT_ISO_READ_UNCOMMITTED,
-          ret = cursor->next(cursor));
+    for (i = 0; i < num_samples; i++) {
+        WT_WITH_TXN_ISOLATION(session, WT_ISO_READ_UNCOMMITTED, ret = cursor->next(cursor));
         if (ret == WT_NOTFOUND) {
             ret = 0;
             break;
         }
         if (ret != 0)
             break;
-        key_count++;
-        /* Sample one split key at each multiple of the minimum range size. */
-        if (key_count % WT_LAYERED_DRAIN_MIN_RANGE_SIZE == 0 && n_collected < max_splits) {
-            WT_ERR(cursor->get_key(cursor, tmp_key));
-            WT_ERR(__wt_buf_set(session, &split_keys[n_collected], tmp_key->data, tmp_key->size));
-            n_collected++;
-        }
+        ret = cursor->get_key(cursor, tmp_key);
+        if (ret == 0)
+            ret = __wt_buf_set(session, &samples[n_collected], tmp_key->data, tmp_key->size);
+        if (ret != 0)
+            break;
+        n_collected++;
     }
     F_CLR(session->txn, WT_TXN_IGNORE_PREPARE);
     WT_ERR(ret);
 
-    /* Skip subdivision if the table is too small for at least two meaningful ranges. */
-    if (n_collected == 0 || key_count < 2 * WT_LAYERED_DRAIN_MIN_RANGE_SIZE) {
-        for (size_t j = 0; j < n_collected; j++)
-            __wt_buf_free(session, &split_keys[j]);
-        __wt_free(session, split_keys);
-    } else {
-        *split_keysp = split_keys;
-        *actual_splitsp = (uint32_t)n_collected;
-        split_keys = NULL;
+    *sampled_keysp = n_collected;
+
+    /* Need at least 2 samples per desired split to produce meaningful boundaries. */
+    n_splits = WT_MIN(max_splits, n_collected / 2);
+    if (n_splits == 0)
+        goto err;
+
+    /* Sort samples lexicographically to approximate the key space distribution. */
+    qsort(samples, n_collected, sizeof(WT_ITEM), __layered_key_cmp);
+
+    WT_ERR(__wt_calloc_def(session, n_splits, &split_keys));
+
+    /* Pick n_splits evenly spaced entries from the sorted sample array. */
+    for (i = 0; i < n_splits; i++) {
+        idx = (uint32_t)((uint64_t)n_collected * (i + 1) / (n_splits + 1));
+        WT_ERR(__wt_buf_set(session, &split_keys[i], samples[idx].data, samples[idx].size));
     }
+
+    *split_keysp = split_keys;
+    *actual_splitsp = n_splits;
+    split_keys = NULL;
 
 err:
     __wt_scr_free(session, &tmp_key);
     if (cursor != NULL)
         WT_TRET(cursor->close(cursor));
+    if (samples != NULL) {
+        for (i = 0; i < num_samples; i++)
+            __wt_buf_free(session, &samples[i]);
+        __wt_free(session, samples);
+    }
     if (split_keys != NULL) {
-        for (uint32_t j = 0; j < max_splits; j++)
-            __wt_buf_free(session, &split_keys[j]);
+        for (i = 0; i < max_splits; i++)
+            __wt_buf_free(session, &split_keys[i]);
         __wt_free(session, split_keys);
     }
     return (ret);
@@ -1144,6 +1175,7 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
     bytes_before = bytes_after = 0;
     size_t i, j, table_count, tables_drained;
     uint32_t actual_splits, total_items;
+    uint64_t sampled_keys, total_sampled_keys;
     bool empty, group_created, queue_initialized;
 
     conn = S2C(session);
@@ -1155,6 +1187,7 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
     actual_splits = 0;
     total_items = 0;
     tables_drained = 0;
+    sampled_keys = total_sampled_keys = 0;
     group_created = false;
     queue_initialized = false;
 
@@ -1204,10 +1237,11 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
 
         /* Sample the ingest table to determine range split points. */
         actual_splits = 0;
+        sampled_keys = 0;
         split_keys = NULL;
-        WT_ERR(__layered_sample_ingest_keys(
-          session, e->ingest_uri, conn->layered_drain_data.thread_count, &split_keys,
-          &actual_splits));
+        WT_ERR(__layered_sample_ingest_keys(session, e->ingest_uri,
+          conn->layered_drain_data.thread_count, &split_keys, &actual_splits, &sampled_keys));
+        total_sampled_keys += sampled_keys;
 
         /* Allocate per-table state; pending starts at the number of ranges. */
         WT_ERR(__wt_calloc_one(session, &ts));
@@ -1320,8 +1354,8 @@ err:
     bytes_after = WT_STAT_CONN_READ(conn->stats, block_byte_read);
     __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
       "Drain complete: %" WT_SIZET_FMT " table(s) %" PRIu32 " work item(s)"
-      " keys=%" PRIu64 " block_bytes_read=%" PRId64,
-      tables_drained, total_items,
+      " sampled_keys=%" PRIu64 " drained_keys=%" PRIu64 " block_bytes_read=%" PRId64,
+      tables_drained, total_items, total_sampled_keys,
       __wt_atomic_load_uint64(&conn->layered_drain_data.total_keys_drained),
       bytes_after - bytes_before);
     if (queue_initialized)
