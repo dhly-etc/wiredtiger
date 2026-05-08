@@ -538,6 +538,7 @@ __layered_copy_ingest_table(WT_SESSION_IMPL *session, const char *ingest_uri,
     ingest_btree_cursor = ((WT_CURSOR_VERSION *)ingest_version_cursor)->file_cursor;
     ingest_btree = CUR2BT(ingest_btree_cursor);
 
+    WT_ERR(__wt_scr_alloc(session, 0, &first_key));
     WT_ERR(__wt_scr_alloc(session, 0, &key));
     WT_ERR(__wt_scr_alloc(session, 0, &tmp_key));
     WT_ERR(__wt_scr_alloc(session, 0, &value));
@@ -778,7 +779,7 @@ err:
           "Drain range extent: table=%s keys=%" PRIu64 " first=%s last=%s",
           ingest_uri, *nkeysp, hex1, hex2);
     }
-    __wt_buf_free(session, first_key);
+    __wt_scr_free(session, &first_key);
     if (upd != NULL)
         __wt_free(session, upd);
     if (upds != NULL)
