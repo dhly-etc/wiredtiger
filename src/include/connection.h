@@ -590,11 +590,12 @@ struct __wt_name_flag {
 /*
  * WT_LAYERED_DRAIN_TABLE_STATE --
  *	Shared per-table state for parallel ingest drain. All work items for the same table point to
- *	one instance. The last range to finish (pending decrements to 0) performs table-level cleanup.
+ *	one instance. The last range to finish (pending decrements to 0) performs table-level
+ *cleanup.
  */
 struct __wt_layered_drain_table_state {
     WT_DATA_HANDLE *ingest_dhandle; /* Pinned once per table; released when pending reaches 0. */
-    uint32_t pending;      /* Atomic: number of key-range work items not yet complete. */
+    uint32_t pending;               /* Atomic: number of key-range work items not yet complete. */
     uint32_t total_ranges; /* Total work items queued for this table (set once, read-only). */
     uint32_t error;        /* First error from any range worker (stored via CAS, 0 = no error). */
 };

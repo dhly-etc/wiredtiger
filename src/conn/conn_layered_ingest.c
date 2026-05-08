@@ -31,8 +31,8 @@ __layered_assert_stable_btree_state(
         has_value = false;
     } else if (cbt->ins != NULL) {
         /*
-         * The key was found via the insert list rather than the on-page binary-search array.
-         * This is legitimate when the stable btree page was reconciled during the leader's last
+         * The key was found via the insert list rather than the on-page binary-search array. This
+         * is legitimate when the stable btree page was reconciled during the leader's last
          * checkpoint but not yet evicted: in-memory WT_INSERT nodes survive reconciliation until
          * the page is evicted. Derive has_value by scanning the insert's update chain for any
          * committed non-tombstone update.
@@ -109,9 +109,9 @@ __layered_move_updates(WT_SESSION_IMPL *session, WT_CURSOR_BTREE *cbt, WT_ITEM *
 
     /*
      * Re-search and retry on WT_RESTART: concurrent drain workers inserting into the same stable
-     * btree page can cause __wt_insert_serial to return WT_RESTART. The standard WiredTiger
-     * pattern is to re-search before every retry. Reset the cursor first to release the hazard
-     * pointer acquired by the previous __wt_row_search, then search again.
+     * btree page can cause __wt_insert_serial to return WT_RESTART. The standard WiredTiger pattern
+     * is to re-search before every retry. Reset the cursor first to release the hazard pointer
+     * acquired by the previous __wt_row_search, then search again.
      */
 retry:
     WT_WITH_PAGE_INDEX(session, ret = __wt_row_search(cbt, key, true, NULL, false, NULL));
@@ -410,8 +410,8 @@ __layered_fix_prepared_transaction(WT_SESSION_IMPL *session, WT_ITEM *key, WT_BT
 
 /*
  * __layered_key_hex --
- *     Write the full hex encoding of a key bound into buf for logging.
- *     A zero-size item (unbounded range end) is rendered as "(none)".
+ *     Write the full hex encoding of a key bound into buf for logging. A zero-size item (unbounded
+ *     range end) is rendered as "(none)".
  */
 static void
 __layered_key_hex(const WT_ITEM *key, char *buf, size_t bufsize)
@@ -421,7 +421,7 @@ __layered_key_hex(const WT_ITEM *key, char *buf, size_t bufsize)
     size_t i, pos;
 
     if (key->size == 0) {
-        (void)snprintf(buf, bufsize, "(none)");
+        WT_IGNORE_RET(__wt_snprintf(buf, bufsize, "(none)"));
         return;
     }
 
@@ -502,8 +502,8 @@ __layered_copy_ingest_table(WT_SESSION_IMPL *session, const char *ingest_uri,
     const char *open_cfg[] = {
       WT_CONFIG_BASE(session, WT_SESSION_open_cursor), "overwrite", NULL, NULL};
     char hex1[WT_LAYERED_KEY_HEX_BUFSIZE], hex2[WT_LAYERED_KEY_HEX_BUFSIZE];
-    bool first_key_set, is_prepare_rollback, preserve_prepared, prepare_resolved,
-      prepare_txn_fixed, skip_first_next;
+    bool first_key_set, is_prepare_rollback, preserve_prepared, prepare_resolved, prepare_txn_fixed,
+      skip_first_next;
 
     ingest_version_cursor = prepare_cursor = stable_cursor = NULL;
     last_upd = prev_upd = upd = upds = NULL;
@@ -557,8 +557,8 @@ __layered_copy_ingest_table(WT_SESSION_IMPL *session, const char *ingest_uri,
             __layered_key_hex(key_start, hex1, sizeof(hex1));
             __layered_key_hex(key_stop != NULL ? key_stop : &(WT_ITEM){0}, hex2, sizeof(hex2));
             __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
-              "Drain range position: table=%s start=%s stop=%s search=not_found",
-              ingest_uri, hex1, hex2);
+              "Drain range position: table=%s start=%s stop=%s search=not_found", ingest_uri, hex1,
+              hex2);
             ret = 0;
             goto err;
         }
@@ -596,8 +596,7 @@ __layered_copy_ingest_table(WT_SESSION_IMPL *session, const char *ingest_uri,
                 __layered_key_hex(tmp_key, hex1, sizeof(hex1));
                 __layered_key_hex(key_stop, hex2, sizeof(hex2));
                 __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
-                  "Drain range stop_boundary: table=%s at=%s stop=%s",
-                  ingest_uri, hex1, hex2);
+                  "Drain range stop_boundary: table=%s at=%s stop=%s", ingest_uri, hex1, hex2);
                 if (upds != NULL) {
                     WT_WITH_DHANDLE(session, cbt->dhandle,
                       ret = __layered_move_updates(session, cbt, key, upds, last_upd));
@@ -766,8 +765,8 @@ err:
         __layered_key_hex(first_key, hex1, sizeof(hex1));
         __layered_key_hex(key, hex2, sizeof(hex2));
         __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
-          "Drain range extent: table=%s keys=%" PRIu64 " first=%s last=%s",
-          ingest_uri, *nkeysp, hex1, hex2);
+          "Drain range extent: table=%s keys=%" PRIu64 " first=%s last=%s", ingest_uri, *nkeysp,
+          hex1, hex2);
     }
     __wt_scr_free(session, &first_key);
     if (upd != NULL)
@@ -913,9 +912,9 @@ err:
 
 /*
  * __layered_drain_worker_run --
- *     Run function for drain workers. Each call dequeues one key-range work item, copies the
- *     ingest data for that range to the stable table, and performs table-level cleanup when it is
- *     the last range to finish.
+ *     Run function for drain workers. Each call dequeues one key-range work item, copies the ingest
+ *     data for that range to the stable table, and performs table-level cleanup when it is the last
+ *     range to finish.
  */
 static int
 __layered_drain_worker_run(WT_SESSION_IMPL *session, WT_THREAD *ctx)
@@ -924,8 +923,8 @@ __layered_drain_worker_run(WT_SESSION_IMPL *session, WT_THREAD *ctx)
     WT_DECL_RET;
     WT_LAYERED_DRAIN_TABLE_STATE *ts;
     WT_LAYERED_DRAIN_WORK_ITEM *work_item;
-    char start_preview[WT_LAYERED_KEY_HEX_BUFSIZE], stop_preview[WT_LAYERED_KEY_HEX_BUFSIZE];
     uint64_t nkeys;
+    char start_preview[WT_LAYERED_KEY_HEX_BUFSIZE], stop_preview[WT_LAYERED_KEY_HEX_BUFSIZE];
     const char *ingest_uri;
 
     conn = S2C(session);
@@ -948,8 +947,8 @@ __layered_drain_worker_run(WT_SESSION_IMPL *session, WT_THREAD *ctx)
     __layered_key_hex(&work_item->key_start, start_preview, sizeof(start_preview));
     __layered_key_hex(&work_item->key_stop, stop_preview, sizeof(stop_preview));
     __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
-      "Drain range begin: table=%s range=%" PRIu32 "/%" PRIu32 " start=%s stop=%s",
-      ingest_uri, work_item->range_index, ts->total_ranges, start_preview, stop_preview);
+      "Drain range begin: table=%s range=%" PRIu32 "/%" PRIu32 " start=%s stop=%s", ingest_uri,
+      work_item->range_index, ts->total_ranges, start_preview, stop_preview);
 
     /* Skip copy if a prior range for this table already failed. */
     if (__wt_atomic_load_uint32_relaxed(&ts->error) == 0) {
@@ -957,8 +956,8 @@ __layered_drain_worker_run(WT_SESSION_IMPL *session, WT_THREAD *ctx)
           work_item->key_start.size > 0 ? &work_item->key_start : NULL,
           work_item->key_stop.size > 0 ? &work_item->key_stop : NULL, &nkeys);
         if (ret != 0) {
-            __wt_err(session, ret, "Failed to copy range of ingest table \"%s\" to stable",
-              ingest_uri);
+            __wt_err(
+              session, ret, "Failed to copy range of ingest table \"%s\" to stable", ingest_uri);
             /* Record the first error via CAS; later failures are suppressed. */
             (void)__wt_atomic_cas_uint32_v(&ts->error, 0, (uint32_t)ret);
         } else
@@ -966,9 +965,8 @@ __layered_drain_worker_run(WT_SESSION_IMPL *session, WT_THREAD *ctx)
     }
 
     __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
-      "Drain range finish: table=%s range=%" PRIu32 "/%" PRIu32 " keys=%" PRIu64 "%s",
-      ingest_uri, work_item->range_index, ts->total_ranges, nkeys,
-      ret != 0 ? " (error)" : "");
+      "Drain range finish: table=%s range=%" PRIu32 "/%" PRIu32 " keys=%" PRIu64 "%s", ingest_uri,
+      work_item->range_index, ts->total_ranges, nkeys, ret != 0 ? " (error)" : "");
 
     /* When all ranges for this table finish, perform table-level cleanup. */
     if (__wt_atomic_sub_uint32(&ts->pending, 1) == 0) {
@@ -1020,8 +1018,7 @@ __layered_ingest_table_is_empty(WT_SESSION_IMPL *session, const char *ingest_uri
     WT_RET(__wt_open_cursor(session, ingest_uri, NULL, NULL, &cursor));
     /* Set WT_TXN_IGNORE_PREPARE so prepared updates don't cause WT_PREPARE_CONFLICT. */
     F_SET(session->txn, WT_TXN_IGNORE_PREPARE);
-    WT_WITH_TXN_ISOLATION(session, WT_ISO_READ_UNCOMMITTED,
-      ret = cursor->next(cursor));
+    WT_WITH_TXN_ISOLATION(session, WT_ISO_READ_UNCOMMITTED, ret = cursor->next(cursor));
     F_CLR(session->txn, WT_TXN_IGNORE_PREPARE);
     if (ret != 0 && ret != WT_NOTFOUND)
         WT_ERR(ret);
@@ -1055,16 +1052,16 @@ __layered_key_cmp(const void *a, const void *b)
 
 /*
  * __layered_sample_ingest_keys --
- *     Sample drainable keys from the ingest table and return up to (num_ranges - 1) split keys
- *     that divide the drainable key space into roughly equal ranges. Uses a version cursor
- *     (filtered by last_checkpoint_timestamp) so that only keys that will actually be drained
- *     contribute to the sample — preventing split points from landing in the pre-checkpoint key
- *     region where no drain work will be done. Applies reservoir sampling (Algorithm R) over
- *     the sequential drainable-key scan so that a single pass produces a uniform random sample
- *     of up to num_ranges^2 keys without knowing the total count in advance. The caller owns the
- *     returned array and must free it. Returns actual_splitsp == 0 when the drainable key space
- *     is too small to subdivide. sampled_keysp receives the total number of unique drainable keys
- *     seen, useful as a proxy for table size in diagnostic logging.
+ *     Sample drainable keys from the ingest table and return up to (num_ranges - 1) split keys that
+ *     divide the drainable key space into roughly equal ranges. Uses a version cursor (filtered by
+ *     last_checkpoint_timestamp) so that only keys that will actually be drained contribute to the
+ *     sample preventing split points from landing in the pre-checkpoint key region where no drain
+ *     work will be done. Applies reservoir sampling (Algorithm R) over the sequential drainable-key
+ *     scan so that a single pass produces a uniform random sample of up to num_ranges^2 keys
+ *     without knowing the total count in advance. The caller owns the returned array and must free
+ *     it. Returns actual_splitsp == 0 when the drainable key space is too small to subdivide.
+ *     sampled_keysp receives the total number of unique drainable keys seen, useful as a proxy for
+ *     table size in diagnostic logging.
  */
 static int
 __layered_sample_ingest_keys(WT_SESSION_IMPL *session, const char *ingest_uri, uint32_t num_ranges,
@@ -1078,9 +1075,9 @@ __layered_sample_ingest_keys(WT_SESSION_IMPL *session, const char *ingest_uri, u
     WT_DECL_ITEM(prev_key);
     WT_DECL_RET;
     WT_ITEM *samples, *split_keys;
-    uint32_t i, idx, j, max_splits, n_collected, n_splits, num_samples;
-    uint64_t key_count;
     wt_timestamp_t last_checkpoint_timestamp;
+    uint64_t key_count;
+    uint32_t i, idx, j, max_splits, n_collected, n_splits, num_samples;
     char buf[256], buf2[64];
     const char *cfg[] = {WT_CONFIG_BASE(session, WT_SESSION_open_cursor), NULL, NULL};
 
@@ -1101,11 +1098,11 @@ __layered_sample_ingest_keys(WT_SESSION_IMPL *session, const char *ingest_uri, u
 
     /*
      * Open a version cursor filtered by last_checkpoint_timestamp so that cursor->next() only
-     * returns drainable (post-checkpoint) keys. This guarantees all split points fall on keys
-     * that drain workers will actually encounter, avoiding the pre-checkpoint dead zone.
+     * returns drainable (post-checkpoint) keys. This guarantees all split points fall on keys that
+     * drain workers will actually encounter, avoiding the pre-checkpoint dead zone.
      */
-    last_checkpoint_timestamp = __wt_atomic_load_uint64_acquire(
-      &conn->disaggregated_storage.last_checkpoint_timestamp);
+    last_checkpoint_timestamp =
+      __wt_atomic_load_uint64_acquire(&conn->disaggregated_storage.last_checkpoint_timestamp);
     if (last_checkpoint_timestamp != WT_TS_NONE)
         WT_ERR(__wt_snprintf(
           buf2, sizeof(buf2), "start_timestamp=%" PRIx64 "", last_checkpoint_timestamp));
@@ -1125,8 +1122,8 @@ __layered_sample_ingest_keys(WT_SESSION_IMPL *session, const char *ingest_uri, u
     /*
      * Reservoir sampling (Algorithm R): stream drainable keys via cursor->next() and maintain a
      * uniform random sample of num_samples unique keys. We read the raw key from the underlying
-     * btree cursor and compare with prev_key to count each unique key exactly once, regardless
-     * of how many versions it has.
+     * btree cursor and compare with prev_key to count each unique key exactly once, regardless of
+     * how many versions it has.
      */
     for (;;) {
         ret = cursor->next(cursor);
@@ -1138,7 +1135,7 @@ __layered_sample_ingest_keys(WT_SESSION_IMPL *session, const char *ingest_uri, u
 
         WT_ERR(cbt->iface.get_key(&cbt->iface, cur_key));
 
-        /* Multiple versions of the same key are returned in sequence — count each key once. */
+        /* Multiple versions of the same key are returned in sequence  count each key once. */
         if (prev_key->size > 0 && prev_key->size == cur_key->size &&
           memcmp(prev_key->data, cur_key->data, cur_key->size) == 0)
             continue;
@@ -1148,8 +1145,7 @@ __layered_sample_ingest_keys(WT_SESSION_IMPL *session, const char *ingest_uri, u
 
         if (key_count <= num_samples) {
             /* Fill the reservoir with the first num_samples keys. */
-            WT_ERR(__wt_buf_set(
-              session, &samples[key_count - 1], cur_key->data, cur_key->size));
+            WT_ERR(__wt_buf_set(session, &samples[key_count - 1], cur_key->data, cur_key->size));
         } else {
             /* Replace a random reservoir slot with probability num_samples / key_count. */
             j = (uint32_t)(__wt_random(&session->rnd_random) % key_count);
@@ -1167,7 +1163,7 @@ __layered_sample_ingest_keys(WT_SESSION_IMPL *session, const char *ingest_uri, u
         goto err;
 
     /* Sort samples lexicographically to approximate the drainable key space distribution. */
-    qsort(samples, n_collected, sizeof(WT_ITEM), __layered_key_cmp);
+    __wt_qsort(samples, n_collected, sizeof(WT_ITEM), __layered_key_cmp);
 
     WT_ERR(__wt_calloc_def(session, n_splits, &split_keys));
 
@@ -1338,8 +1334,7 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
             }
         }));
         if (ts->ingest_dhandle == NULL)
-            WT_ERR_MSG(session, WT_NOTFOUND, "ingest dhandle not found for \"%s\"",
-              e->ingest_uri);
+            WT_ERR_MSG(session, WT_NOTFOUND, "ingest dhandle not found for \"%s\"", e->ingest_uri);
 
         /* Enqueue one work item per range [0 .. actual_splits]. */
         for (j = 0; j <= (size_t)actual_splits; j++) {
@@ -1357,10 +1352,8 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
             {
                 char start_preview[WT_LAYERED_KEY_HEX_BUFSIZE];
                 char stop_preview[WT_LAYERED_KEY_HEX_BUFSIZE];
-                __layered_key_hex(&work_item->key_start, start_preview,
-                  sizeof(start_preview));
-                __layered_key_hex(&work_item->key_stop, stop_preview,
-                  sizeof(stop_preview));
+                __layered_key_hex(&work_item->key_start, start_preview, sizeof(start_preview));
+                __layered_key_hex(&work_item->key_stop, stop_preview, sizeof(stop_preview));
                 __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
                   "Drain range queued: table=%s range=%" PRIu32 "/%" PRIu32 " start=%s stop=%s",
                   e->ingest_uri, (uint32_t)j, ts->total_ranges, start_preview, stop_preview);
@@ -1425,7 +1418,8 @@ err:
     }
     bytes_after = WT_STAT_CONN_READ(conn->stats, block_byte_read);
     __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
-      "Drain complete: %" WT_SIZET_FMT " table(s) %" PRIu32 " work item(s)"
+      "Drain complete: %" WT_SIZET_FMT " table(s) %" PRIu32
+      " work item(s)"
       " sampled_keys=%" PRIu64 " drained_keys=%" PRIu64 " block_bytes_read=%" PRId64,
       tables_drained, total_items, total_sampled_keys,
       __wt_atomic_load_uint64(&conn->layered_drain_data.total_keys_drained),

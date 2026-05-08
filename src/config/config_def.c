@@ -4186,15 +4186,9 @@ static const WT_CONFIG_ENTRY config_entries[] = {
     "rollback_error=0,slow_checkpoint=false,stress_skiplist=false,"
     "table_logging=false,tiered_flush_error_continue=false,"
     "update_restore_evict=false),disaggregated=(checkpoint_meta=,"
-<<<<<<< HEAD
-    "drain_threads=8,last_materialized_lsn=,local_files_action=delete"
-    ",lose_all_my_data=false,role=),error_prefix=,"
-    "eviction=(app_eviction_min_cache_fill_ratio=0,"
-=======
     "drain_threads=128,last_materialized_lsn=,"
     "local_files_action=delete,lose_all_my_data=false,role=),"
     "error_prefix=,eviction=(app_eviction_min_cache_fill_ratio=0,"
->>>>>>> 2cbfb94c34 (Raise drain_threads default from 32 to 128)
     "cache_tolerance_for_app_eviction=0,evict_sample_inmem=true,"
     "evict_use_softptr=false,incremental_app_eviction=false,"
     "legacy_page_visit_strategy=false,prefer_scrub_eviction=false,"
@@ -4525,11 +4519,7 @@ static const WT_CONFIG_ENTRY config_entries[] = {
     "rollback_error=0,slow_checkpoint=false,stress_skiplist=false,"
     "table_logging=false,tiered_flush_error_continue=false,"
     "update_restore_evict=false),direct_io=,"
-<<<<<<< HEAD
-    "disaggregated=(checkpoint_meta=,drain_threads=8,"
-=======
     "disaggregated=(checkpoint_meta=,drain_threads=128,"
->>>>>>> 2cbfb94c34 (Raise drain_threads default from 32 to 128)
     "last_materialized_lsn=,local_files_action=delete,"
     "lose_all_my_data=false,page_log=,role=),encryption=(keyid=,name="
     ",secretkey=),error_prefix=,"
@@ -4600,11 +4590,7 @@ static const WT_CONFIG_ENTRY config_entries[] = {
     "rollback_error=0,slow_checkpoint=false,stress_skiplist=false,"
     "table_logging=false,tiered_flush_error_continue=false,"
     "update_restore_evict=false),direct_io=,"
-<<<<<<< HEAD
-    "disaggregated=(checkpoint_meta=,drain_threads=8,"
-=======
     "disaggregated=(checkpoint_meta=,drain_threads=128,"
->>>>>>> 2cbfb94c34 (Raise drain_threads default from 32 to 128)
     "last_materialized_lsn=,local_files_action=delete,"
     "lose_all_my_data=false,page_log=,role=),encryption=(keyid=,name="
     ",secretkey=),error_prefix=,"
@@ -4676,11 +4662,7 @@ static const WT_CONFIG_ENTRY config_entries[] = {
     "rollback_error=0,slow_checkpoint=false,stress_skiplist=false,"
     "table_logging=false,tiered_flush_error_continue=false,"
     "update_restore_evict=false),direct_io=,"
-<<<<<<< HEAD
-    "disaggregated=(checkpoint_meta=,drain_threads=8,"
-=======
     "disaggregated=(checkpoint_meta=,drain_threads=128,"
->>>>>>> 2cbfb94c34 (Raise drain_threads default from 32 to 128)
     "last_materialized_lsn=,local_files_action=delete,"
     "lose_all_my_data=false,page_log=,role=),encryption=(keyid=,name="
     ",secretkey=),error_prefix=,"
@@ -4751,11 +4733,7 @@ static const WT_CONFIG_ENTRY config_entries[] = {
     "rollback_error=0,slow_checkpoint=false,stress_skiplist=false,"
     "table_logging=false,tiered_flush_error_continue=false,"
     "update_restore_evict=false),direct_io=,"
-<<<<<<< HEAD
-    "disaggregated=(checkpoint_meta=,drain_threads=8,"
-=======
     "disaggregated=(checkpoint_meta=,drain_threads=128,"
->>>>>>> 2cbfb94c34 (Raise drain_threads default from 32 to 128)
     "last_materialized_lsn=,local_files_action=delete,"
     "lose_all_my_data=false,page_log=,role=),encryption=(keyid=,name="
     ",secretkey=),error_prefix=,"
