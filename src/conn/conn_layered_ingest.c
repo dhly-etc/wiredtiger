@@ -1071,81 +1071,6 @@ __layered_count_raw_keys(WT_SESSION_IMPL *session, const char *ingest_uri, uint6
 }
 
 /*
- * __layered_count_drainable_keys --
- *     Count unique keys in the ingest table that are visible to the drain version cursor (i.e.
- *     have at least one version with durable_start_ts > last_checkpoint_timestamp). This should
- *     equal the sum of keys reported by drain workers for the same table. Used for diagnostic
- *     logging to isolate whether a low drained-key count is due to timestamp filtering or an
- *     empty ingest table.
- */
-static int
-__layered_count_drainable_keys(WT_SESSION_IMPL *session, const char *ingest_uri, uint64_t *countp)
-{
-    WT_CONNECTION_IMPL *conn;
-    WT_CURSOR *cursor;
-    WT_CURSOR_BTREE *cbt;
-    WT_CURSOR_VERSION *cversion;
-    WT_DECL_ITEM(cur_key);
-    WT_DECL_ITEM(prev_key);
-    WT_DECL_RET;
-    wt_timestamp_t last_checkpoint_timestamp;
-    uint64_t n;
-    char buf[256], buf2[64];
-    const char *cfg[] = {WT_CONFIG_BASE(session, WT_SESSION_open_cursor), NULL, NULL};
-
-    conn = S2C(session);
-    cursor = NULL;
-    *countp = 0;
-    n = 0;
-
-    last_checkpoint_timestamp = __wt_atomic_load_uint64_acquire(
-      &conn->disaggregated_storage.last_checkpoint_timestamp);
-    if (last_checkpoint_timestamp != WT_TS_NONE)
-        WT_ERR(__wt_snprintf(
-          buf2, sizeof(buf2), "start_timestamp=%" PRIx64 "", last_checkpoint_timestamp));
-    else
-        buf2[0] = '\0';
-    WT_ERR(__wt_snprintf(buf, sizeof(buf),
-      "debug=(dump_version=(enabled=true,raw_key_value=true,timestamp_order=true,cross_key=true,"
-      "show_prepared_rollback=false,%s))",
-      buf2));
-    cfg[1] = buf;
-    WT_ERR(__wt_open_cursor(session, ingest_uri, NULL, cfg, &cursor));
-    cversion = (WT_CURSOR_VERSION *)cursor;
-    cbt = (WT_CURSOR_BTREE *)cversion->file_cursor;
-
-    WT_ERR(__wt_scr_alloc(session, 0, &prev_key));
-    WT_ERR(__wt_scr_alloc(session, 0, &cur_key));
-
-    for (;;) {
-        ret = cursor->next(cursor);
-        if (ret == WT_NOTFOUND) {
-            ret = 0;
-            break;
-        }
-        WT_ERR(ret);
-        /*
-         * Obtain the raw key from the underlying file cursor (same as the drain worker does).
-         * Count each unique key once regardless of how many versions it has.
-         */
-        WT_ERR(cbt->iface.get_key(&cbt->iface, cur_key));
-        if (prev_key->size == 0 || prev_key->size != cur_key->size ||
-          memcmp(prev_key->data, cur_key->data, cur_key->size) != 0) {
-            n++;
-            WT_ERR(__wt_buf_set(session, prev_key, cur_key->data, cur_key->size));
-        }
-    }
-
-err:
-    __wt_scr_free(session, &prev_key);
-    __wt_scr_free(session, &cur_key);
-    if (cursor != NULL)
-        WT_TRET(cursor->close(cursor));
-    *countp = n;
-    return (ret);
-}
-
-/*
  * __layered_key_cmp --
  *     Lexicographic comparator for WT_ITEM keys; suitable as a qsort callback.
  */
@@ -1355,7 +1280,7 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
     bytes_before = bytes_after = 0;
     size_t i, j, table_count, tables_drained;
     uint32_t actual_splits, total_items;
-    uint64_t drainable_keys, raw_keys, sampled_keys, total_sampled_keys;
+    uint64_t raw_keys, sampled_keys, total_sampled_keys;
     bool empty, group_created, queue_initialized;
 
     conn = S2C(session);
@@ -1367,7 +1292,7 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
     actual_splits = 0;
     total_items = 0;
     tables_drained = 0;
-    drainable_keys = raw_keys = sampled_keys = total_sampled_keys = 0;
+    raw_keys = sampled_keys = total_sampled_keys = 0;
     group_created = false;
     queue_initialized = false;
 
@@ -1415,21 +1340,25 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
             continue;
         ++tables_drained;
 
-        /* Count raw and drainable keys for diagnostic logging before enqueuing work. */
-        raw_keys = drainable_keys = 0;
+        /* Count raw keys for the audit log (all keys, regardless of timestamp). */
+        raw_keys = 0;
         WT_ERR(__layered_count_raw_keys(session, e->ingest_uri, &raw_keys));
-        WT_ERR(__layered_count_drainable_keys(session, e->ingest_uri, &drainable_keys));
-        __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
-          "Drain table audit: table=%s raw_keys=%" PRIu64 " drainable_keys=%" PRIu64,
-          e->ingest_uri, raw_keys, drainable_keys);
 
-        /* Sample the ingest table to determine range split points. */
+        /*
+         * Sample the ingest table to determine range split points. The sampling pass iterates every
+         * unique drainable key, so sampled_keys doubles as the drainable-key count for the audit
+         * log — no separate counting pass needed.
+         */
         actual_splits = 0;
         sampled_keys = 0;
         split_keys = NULL;
         WT_ERR(__layered_sample_ingest_keys(session, e->ingest_uri,
           conn->layered_drain_data.thread_count, &split_keys, &actual_splits, &sampled_keys));
         total_sampled_keys += sampled_keys;
+
+        __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
+          "Drain table audit: table=%s raw_keys=%" PRIu64 " drainable_keys=%" PRIu64,
+          e->ingest_uri, raw_keys, sampled_keys);
 
         /* Allocate per-table state; pending starts at the number of ranges. */
         WT_ERR(__wt_calloc_one(session, &ts));
