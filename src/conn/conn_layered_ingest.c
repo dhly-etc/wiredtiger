@@ -496,7 +496,7 @@ __layered_copy_ingest_table(WT_SESSION_IMPL *session, const char *ingest_uri,
       stop_ts;
     uint64_t start_prepared_id, start_txn, stop_prepared_id, stop_txn;
     uint8_t flags, location, prepare, type;
-    int cmp, exact;
+    int cmp;
     char buf[256], buf2[64];
     const char *cfg[] = {WT_CONFIG_BASE(session, WT_SESSION_open_cursor), NULL, NULL, NULL};
     const char *open_cfg[] = {
@@ -544,34 +544,24 @@ __layered_copy_ingest_table(WT_SESSION_IMPL *session, const char *ingest_uri,
     WT_ERR(__wt_scr_alloc(session, 0, &value));
 
     /*
-     * If a start key is supplied, position the version cursor at the first key >= key_start using
-     * search_near. On success the cursor is already positioned (skip the first next() call).
-     * WT_NOTFOUND means no keys exist at or after key_start — nothing to drain for this range.
+     * If a start key is supplied, position the version cursor at key_start using an exact search.
+     * Split keys are sampled from the same version cursor (same start_timestamp filter) used during
+     * drain, so key_start is guaranteed to be a drainable key. WT_NOTFOUND is therefore a
+     * defensive-only path: it would only fire if a concurrent operation removed the key between
+     * sampling and drain. Treat it as nothing to drain for this range.
      */
     if (key_start != NULL) {
         ingest_version_cursor->set_key(ingest_version_cursor, key_start);
-        /*
-         * Use keep=true so that WT_NOTFOUND is preserved in ret after the call. Without it the
-         * WT_ERR_NOTFOUND_OK macro clears ret to 0 and the subsequent guard never fires.
-         */
-        WT_ERR_NOTFOUND_OK(ingest_version_cursor->search_near(ingest_version_cursor, &exact),
-          true);
+        WT_ERR_NOTFOUND_OK(ingest_version_cursor->search(ingest_version_cursor), true);
         if (ret == WT_NOTFOUND) {
             __layered_key_hex(key_start, hex1, sizeof(hex1));
             __layered_key_hex(key_stop != NULL ? key_stop : &(WT_ITEM){0}, hex2, sizeof(hex2));
             __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
-              "Drain range position: table=%s start=%s stop=%s search_near=not_found",
+              "Drain range position: table=%s start=%s stop=%s search=not_found",
               ingest_uri, hex1, hex2);
             ret = 0;
-            goto err; /* no visible keys at or after key_start */
+            goto err;
         }
-        /* Log where search_near actually positioned us relative to key_start. */
-        WT_ERR(ingest_version_cursor->get_key(ingest_version_cursor, tmp_key));
-        __layered_key_hex(key_start, hex1, sizeof(hex1));
-        __layered_key_hex(tmp_key, hex2, sizeof(hex2));
-        __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
-          "Drain range position: table=%s start=%s exact=%d actual=%s",
-          ingest_uri, hex1, exact, hex2);
         skip_first_next = true;
     }
 

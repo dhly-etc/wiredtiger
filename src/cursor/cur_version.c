@@ -1088,82 +1088,6 @@ err:
 }
 
 /*
- * __curversion_search_near --
- *     WT_CURSOR->search_near method for version cursors. Positions the cursor at the first version
- *     of the first key >= the search key, matching the semantics required by range-based ingest
- *     drain. Unlike search, this succeeds even when the search key does not exist exactly.
- */
-static int
-__curversion_search_near(WT_CURSOR *cursor, int *exactp)
-{
-    WT_CURSOR *file_cursor;
-    WT_CURSOR_BTREE *cbt;
-    WT_CURSOR_VERSION *version_cursor;
-    WT_DECL_RET;
-    WT_SESSION_IMPL *session;
-    WT_TXN *txn;
-    int exact;
-
-    version_cursor = (WT_CURSOR_VERSION *)cursor;
-    file_cursor = version_cursor->file_cursor;
-    cbt = (WT_CURSOR_BTREE *)file_cursor;
-
-    CURSOR_API_CALL(cursor, session, ret, search_near, cbt->dhandle);
-    txn = session->txn;
-
-    if (txn->isolation != WT_ISO_SNAPSHOT)
-        WT_ERR_SUB(session, WT_ROLLBACK, WT_NONE,
-          "version cursor can only be called with snapshot isolation");
-
-    WT_ERR(__cursor_checkkey(file_cursor));
-    if (F_ISSET(file_cursor, WT_CURSTD_KEY_INT))
-        WT_ERR_SUB(
-          session, WT_ROLLBACK, WT_NONE, "version cursor cannot be called when it is positioned");
-
-    /* Position the file cursor at the nearest key. */
-    WT_ERR(__wt_btcur_search_near(cbt, &exact));
-    WT_ASSERT(session, F_ISSET(file_cursor, WT_CURSTD_KEY_INT));
-
-    /*
-     * If the nearest key is before the search key, advance to the next key so that we are
-     * positioned at the first key strictly >= the search key.
-     */
-    if (exact < 0) {
-        WT_ERR(__wt_btcur_next(cbt, false));
-        exact = 1;
-    }
-
-    WT_ERR(__curversion_skip_starting_updates(session, version_cursor));
-
-    /*
-     * Advance key-by-key until we land on one that has at least one version visible to the version
-     * cursor. Keys whose updates are all filtered by the timestamp window (e.g. all below
-     * last_checkpoint_timestamp in the ingest-drain context) appear in the btree but return
-     * WT_NOTFOUND from __curversion_next_single_key. Mirror the loop used by __curversion_next so
-     * that search_near skips over such invisible keys rather than returning WT_NOTFOUND.
-     */
-    for (;;) {
-        WT_ERR_NOTFOUND_OK(__curversion_next_single_key(cursor), true);
-        if (ret == 0)
-            break;
-        /* No visible updates at this key — step to the next key. */
-        WT_ERR(__curversion_version_reset(version_cursor));
-        WT_ASSERT(session, F_ISSET(file_cursor, WT_CURSTD_KEY_INT));
-        F_SET(file_cursor, WT_CURSTD_KEY_ONLY);
-        WT_ERR(__wt_btcur_next(cbt, false));
-        WT_ASSERT(session, F_ISSET(file_cursor, WT_CURSTD_KEY_INT));
-        WT_ERR(__curversion_skip_starting_updates(session, version_cursor));
-    }
-
-    *exactp = exact;
-
-err:
-    if (ret != 0)
-        WT_TRET(cursor->reset(cursor));
-    API_END_RET(session, ret);
-}
-
-/*
  * __curversion_close --
  *     WT_CURSOR->close method for version cursors.
  */
@@ -1216,7 +1140,7 @@ __wt_curversion_open(WT_SESSION_IMPL *session, const char *uri, WT_CURSOR *owner
       __wt_cursor_notsup,                              /* prev */
       __curversion_reset,                              /* reset */
       __curversion_search,                             /* search */
-      __curversion_search_near,                        /* search-near */
+      __wt_cursor_search_near_notsup,                  /* search-near */
       __wt_cursor_notsup,                              /* insert */
       __wt_cursor_modify_notsup,                       /* modify */
       __wt_cursor_notsup,                              /* update */
