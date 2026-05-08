@@ -29,7 +29,7 @@ __layered_assert_stable_btree_state(
             return;
         /* No on-page value to check; rely solely on visibility. */
         has_value = false;
-    else if (cbt->ins != NULL) {
+    } else if (cbt->ins != NULL) {
         /*
          * The key was found via the insert list rather than the on-page binary-search array.
          * This is legitimate when the stable btree page was reconciled during the leader's last
@@ -405,6 +405,34 @@ __layered_fix_prepared_transaction(WT_SESSION_IMPL *session, WT_ITEM *key, WT_BT
       __wt_session_array_walk(session, __layered_fix_prepared_transaction_callback, true, &cookie));
 }
 
+/* Buffer large enough for 255 bytes of key as hex plus NUL. */
+#define WT_LAYERED_KEY_HEX_BUFSIZE 512
+
+/*
+ * __layered_key_hex --
+ *     Write the full hex encoding of a key bound into buf for logging.
+ *     A zero-size item (unbounded range end) is rendered as "(none)".
+ */
+static void
+__layered_key_hex(const WT_ITEM *key, char *buf, size_t bufsize)
+{
+    static const char hex[] = "0123456789abcdef";
+    const uint8_t *data;
+    size_t i, pos;
+
+    if (key->size == 0) {
+        (void)snprintf(buf, bufsize, "(none)");
+        return;
+    }
+
+    data = (const uint8_t *)key->data;
+    for (i = 0, pos = 0; i < key->size && pos + 2 < bufsize; i++) {
+        buf[pos++] = hex[(data[i] >> 4) & 0xf];
+        buf[pos++] = hex[data[i] & 0xf];
+    }
+    buf[pos] = '\0';
+}
+
 /*
  * __layered_apply_truncate_to_stable --
  *     Replay a single follower-recorded truncate against stable. This needs to be done after all
@@ -456,6 +484,7 @@ __layered_copy_ingest_table(WT_SESSION_IMPL *session, const char *ingest_uri,
     WT_BTREE *ingest_btree, *stable_btree;
     WT_CURSOR *ingest_btree_cursor, *ingest_version_cursor, *prepare_cursor, *stable_cursor;
     WT_CURSOR_BTREE *cbt;
+    WT_DECL_ITEM(first_key);
     WT_DECL_ITEM(key);
     WT_DECL_ITEM(stable_uri_buf);
     WT_DECL_ITEM(tmp_key);
@@ -472,12 +501,13 @@ __layered_copy_ingest_table(WT_SESSION_IMPL *session, const char *ingest_uri,
     const char *cfg[] = {WT_CONFIG_BASE(session, WT_SESSION_open_cursor), NULL, NULL, NULL};
     const char *open_cfg[] = {
       WT_CONFIG_BASE(session, WT_SESSION_open_cursor), "overwrite", NULL, NULL};
-    bool in_ts_range, is_prepare_rollback, prepare_resolved, preserve_prepared, prepare_txn_fixed,
-      skip_first_next;
+    char hex1[WT_LAYERED_KEY_HEX_BUFSIZE], hex2[WT_LAYERED_KEY_HEX_BUFSIZE];
+    bool first_key_set, is_prepare_rollback, preserve_prepared, prepare_resolved,
+      prepare_txn_fixed, skip_first_next;
 
     ingest_version_cursor = prepare_cursor = stable_cursor = NULL;
     last_upd = prev_upd = upd = upds = NULL;
-    prepare_resolved = prepare_txn_fixed = skip_first_next = false;
+    first_key_set = prepare_resolved = prepare_txn_fixed = skip_first_next = false;
     preserve_prepared = F_ISSET(S2C(session), WT_CONN_PRESERVE_PREPARED);
     *nkeysp = 0;
 
@@ -526,9 +556,21 @@ __layered_copy_ingest_table(WT_SESSION_IMPL *session, const char *ingest_uri,
         WT_ERR_NOTFOUND_OK(ingest_version_cursor->search_near(ingest_version_cursor, &exact),
           true);
         if (ret == WT_NOTFOUND) {
+            __layered_key_hex(key_start, hex1, sizeof(hex1));
+            __layered_key_hex(key_stop != NULL ? key_stop : &(WT_ITEM){0}, hex2, sizeof(hex2));
+            __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
+              "Drain range position: table=%s start=%s stop=%s search_near=not_found",
+              ingest_uri, hex1, hex2);
             ret = 0;
             goto err; /* no visible keys at or after key_start */
         }
+        /* Log where search_near actually positioned us relative to key_start. */
+        WT_ERR(ingest_version_cursor->get_key(ingest_version_cursor, tmp_key));
+        __layered_key_hex(key_start, hex1, sizeof(hex1));
+        __layered_key_hex(tmp_key, hex2, sizeof(hex2));
+        __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
+          "Drain range position: table=%s start=%s exact=%d actual=%s",
+          ingest_uri, hex1, exact, hex2);
         skip_first_next = true;
     }
 
@@ -560,6 +602,11 @@ __layered_copy_ingest_table(WT_SESSION_IMPL *session, const char *ingest_uri,
         if (key_stop != NULL) {
             WT_ERR(__wt_compare(session, stable_btree->collator, tmp_key, key_stop, &cmp));
             if (cmp >= 0) {
+                __layered_key_hex(tmp_key, hex1, sizeof(hex1));
+                __layered_key_hex(key_stop, hex2, sizeof(hex2));
+                __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
+                  "Drain range stop_boundary: table=%s at=%s stop=%s",
+                  ingest_uri, hex1, hex2);
                 if (upds != NULL) {
                     WT_WITH_DHANDLE(session, cbt->dhandle,
                       ret = __layered_move_updates(session, cbt, key, upds, last_upd));
@@ -578,6 +625,11 @@ __layered_copy_ingest_table(WT_SESSION_IMPL *session, const char *ingest_uri,
              * has been initialized.
              */
             WT_ASSERT(session, key->size == 0 || cmp <= 0);
+
+            if (!first_key_set) {
+                WT_ERR(__wt_buf_set(session, first_key, tmp_key->data, tmp_key->size));
+                first_key_set = true;
+            }
 
             if (upds != NULL) {
                 WT_WITH_DHANDLE(session, cbt->dhandle,
@@ -719,6 +771,14 @@ __layered_copy_ingest_table(WT_SESSION_IMPL *session, const char *ingest_uri,
     }
 
 err:
+    if (*nkeysp > 0) {
+        __layered_key_hex(first_key, hex1, sizeof(hex1));
+        __layered_key_hex(key, hex2, sizeof(hex2));
+        __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
+          "Drain range extent: table=%s keys=%" PRIu64 " first=%s last=%s",
+          ingest_uri, *nkeysp, hex1, hex2);
+    }
+    __wt_buf_free(session, first_key);
     if (upd != NULL)
         __wt_free(session, upd);
     if (upds != NULL)
@@ -734,34 +794,6 @@ err:
     if (stable_cursor != NULL)
         WT_TRET(stable_cursor->close(stable_cursor));
     return (ret);
-}
-
-/* Buffer large enough for 255 bytes of key as hex plus NUL. */
-#define WT_LAYERED_KEY_HEX_BUFSIZE 512
-
-/*
- * __layered_key_hex --
- *     Write the full hex encoding of a key bound into buf for logging.
- *     A zero-size item (unbounded range end) is rendered as "(none)".
- */
-static void
-__layered_key_hex(const WT_ITEM *key, char *buf, size_t bufsize)
-{
-    static const char hex[] = "0123456789abcdef";
-    const uint8_t *data;
-    size_t i, pos;
-
-    if (key->size == 0) {
-        (void)snprintf(buf, bufsize, "(none)");
-        return;
-    }
-
-    data = (const uint8_t *)key->data;
-    for (i = 0, pos = 0; i < key->size && pos + 2 < bufsize; i++) {
-        buf[pos++] = hex[(data[i] >> 4) & 0xf];
-        buf[pos++] = hex[data[i] & 0xf];
-    }
-    buf[pos] = '\0';
 }
 
 /*
