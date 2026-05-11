@@ -971,7 +971,11 @@ __layered_drain_worker_run(WT_SESSION_IMPL *session, WT_THREAD *ctx)
     /* When all ranges for this table finish, perform table-level cleanup. */
     if (__wt_atomic_sub_uint32(&ts->pending, 1) == 0) {
         if (__wt_atomic_load_uint32_relaxed(&ts->error) == 0) {
+            uint64_t t_trunc = __wt_clock(session);
             WT_TRET(__layered_clear_ingest_table(session, ingest_uri));
+            __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
+              "Drain truncate: table=%s truncate_ms=%" PRIu64, ingest_uri,
+              WT_CLOCKDIFF_MS(__wt_clock(session), t_trunc));
 #ifdef HAVE_DIAGNOSTIC
             if (ret == 0)
                 WT_TRET(__layered_assert_ingest_table_empty(session, ingest_uri));
@@ -1241,6 +1245,7 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
     size_t i, j, table_count, tables_drained;
     uint32_t actual_splits, total_items;
     uint64_t sampled_keys, total_sampled_keys;
+    uint64_t t_start, t_drain_start, t_drain_end, t_sample_start, total_sampling_ms;
     bool empty, group_created, queue_initialized;
 
     conn = S2C(session);
@@ -1253,6 +1258,7 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
     total_items = 0;
     tables_drained = 0;
     sampled_keys = total_sampled_keys = 0;
+    t_start = t_drain_start = t_drain_end = t_sample_start = total_sampling_ms = 0;
     group_created = false;
     queue_initialized = false;
 
@@ -1277,6 +1283,7 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
 
     bytes_before = WT_STAT_CONN_READ(conn->stats, block_byte_read);
     __wt_atomic_store_uint64(&conn->layered_drain_data.total_keys_drained, 0);
+    t_start = __wt_clock(session);
 
     /* Initialize the work queue before spawning any threads. */
     TAILQ_INIT(&conn->layered_drain_data.work_queue);
@@ -1304,12 +1311,17 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
         actual_splits = 0;
         sampled_keys = 0;
         split_keys = NULL;
+        t_sample_start = __wt_clock(session);
         WT_ERR(__layered_sample_ingest_keys(session, e->ingest_uri,
           conn->layered_drain_data.thread_count, &split_keys, &actual_splits, &sampled_keys));
         total_sampled_keys += sampled_keys;
-
-        __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
-          "Drain table audit: table=%s drainable_keys=%" PRIu64, e->ingest_uri, sampled_keys);
+        {
+            uint64_t sampling_ms = WT_CLOCKDIFF_MS(__wt_clock(session), t_sample_start);
+            total_sampling_ms += sampling_ms;
+            __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
+              "Drain table audit: table=%s drainable_keys=%" PRIu64 " sampling_ms=%" PRIu64,
+              e->ingest_uri, sampled_keys, sampling_ms);
+        }
 
         /* Allocate per-table state; pending starts at the number of ranges. */
         WT_ERR(__wt_calloc_one(session, &ts));
@@ -1379,6 +1391,7 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
      * Create background drain threads after the queue is fully populated. The calling thread also
      * acts as a drain worker, so we request (thread_count - 1) background threads.
      */
+    t_drain_start = __wt_clock(session);
     if (conn->layered_drain_data.thread_count > 1 && total_items > 0) {
         WT_ERR(__wt_thread_group_create(session, &conn->layered_drain_data.threads, "disagg-drain",
           conn->layered_drain_data.thread_count - 1, conn->layered_drain_data.thread_count - 1,
@@ -1394,6 +1407,7 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
         __wt_spin_unlock(session, &conn->layered_drain_data.queue_lock);
         if (empty) {
             __wt_atomic_store_bool_relaxed(&conn->layered_drain_data.running, false);
+            t_drain_end = __wt_clock(session);
             break;
         }
         WT_ERR(__layered_drain_worker_run(session, NULL));
@@ -1417,13 +1431,21 @@ err:
         WT_TRET(__wt_thread_group_destroy(session, &conn->layered_drain_data.threads));
     }
     bytes_after = WT_STAT_CONN_READ(conn->stats, block_byte_read);
-    __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
-      "Drain complete: %" WT_SIZET_FMT " table(s) %" PRIu32
-      " work item(s)"
-      " sampled_keys=%" PRIu64 " drained_keys=%" PRIu64 " block_bytes_read=%" PRId64,
-      tables_drained, total_items, total_sampled_keys,
-      __wt_atomic_load_uint64(&conn->layered_drain_data.total_keys_drained),
-      bytes_after - bytes_before);
+    {
+        uint64_t t_now = __wt_clock(session);
+        __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
+          "Drain complete: %" WT_SIZET_FMT " table(s) %" PRIu32
+          " work item(s)"
+          " sampled_keys=%" PRIu64 " drained_keys=%" PRIu64 " block_bytes_read=%" PRId64
+          " sampling_ms=%" PRIu64 " drain_ms=%" PRIu64 " teardown_ms=%" PRIu64
+          " total_ms=%" PRIu64,
+          tables_drained, total_items, total_sampled_keys,
+          __wt_atomic_load_uint64(&conn->layered_drain_data.total_keys_drained),
+          bytes_after - bytes_before, total_sampling_ms,
+          t_drain_end > t_drain_start ? WT_CLOCKDIFF_MS(t_drain_end, t_drain_start) : 0,
+          t_drain_end > 0 ? WT_CLOCKDIFF_MS(t_now, t_drain_end) : 0,
+          t_start > 0 ? WT_CLOCKDIFF_MS(t_now, t_start) : 0);
+    }
     if (queue_initialized)
         __layered_drain_clear_work_queue(session);
     /*
