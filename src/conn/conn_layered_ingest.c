@@ -1427,7 +1427,7 @@ err:
     bytes_after = WT_STAT_CONN_READ(conn->stats, block_byte_read);
     {
         uint64_t t_now = __wt_clock(session);
-        __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
+        __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_INFO,
           "Drain complete: %" WT_SIZET_FMT " table(s) %" PRIu32
           " work item(s)"
           " sampled_keys=%" PRIu64 " drained_keys=%" PRIu64 " block_bytes_read=%" PRId64

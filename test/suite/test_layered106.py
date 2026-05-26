@@ -578,5 +578,384 @@ class test_layered106(wttest.WiredTigerTestCase):
         read_cursor.close()
         read_session.close()
 
+    # -----------------------------------------------------------------------
+    # Test 9: Updates to stable-btree keys survive drain after follower step-up.
+    #
+    # Keys written before the follower step-down live in the stable btree.
+    # The follower then overwrites some of those keys (updates) and also
+    # inserts brand-new keys — both classes of write land in the ingest btree.
+    # After step-up, drain must move the ingest updates on top of the existing
+    # stable entries and move the fresh inserts into stable as well.
+    # The final checkpoint and re-read (as a follower) verify that all updated
+    # values are correct and all fresh keys are present.
+    # -----------------------------------------------------------------------
+
+    def test_drain_update_existing_stable_key(self):
+        """
+        Verify that ingest-btree updates to keys that already exist in the stable
+        btree are correctly drained into stable after follower step-up.  The test
+        also inserts genuinely new keys in the same follower batch to exercise the
+        mixed (update + insert) drain path.
+
+        Timeline:
+          n_stable keys are written as leader -> stable btree, then checkpointed.
+          [reconfigure to follower]
+          First n_update of those keys are overwritten (oplog.update) in ingest.
+          n_fresh brand-new keys are appended (oplog.insert) in ingest.
+          [reconfigure to leader -> drain runs]
+          stable_timestamp advanced, checkpoint taken.
+          [connection closed and reopened as follower]
+          oplog.check verifies every oplog entry (original inserts, updates, fresh
+          inserts) against the new leader checkpoint.
+        """
+        uri = 'layered:test_layered106_update'
+
+        oplog = Oplog()
+        t = oplog.add_uri(uri)
+
+        n_stable = 50 * self.multiplier
+        n_update = 20 * self.multiplier
+        n_fresh  = 20 * self.multiplier
+
+        # --- Phase 1: leader writes n_stable keys and checkpoints them. ---
+        oplog.insert(t, n_stable)
+
+        self.session.create(uri, 'key_format=S,value_format=S')
+        oplog.apply(self, self.session, 0, n_stable)
+        self.conn.set_timestamp(
+            f'stable_timestamp={self.timestamp_str(oplog.last_timestamp())}')
+        self.session.checkpoint()
+
+        # --- Phase 2: reconfigure as follower, apply updates + fresh inserts. ---
+        self.conn.reconfigure('disaggregated=(role="follower")')
+        follower_session = self.conn.open_session('')
+
+        # Overwrite the first n_update stable keys — their updates land in ingest.
+        oplog.update(t, n_update)
+        # Insert n_fresh brand-new keys — also land in ingest.
+        oplog.insert(t, n_fresh)
+
+        total = n_stable + n_update + n_fresh
+
+        # Apply the follower's batch (the n_update + n_fresh new oplog entries).
+        oplog.apply(self, follower_session, n_stable, n_update + n_fresh)
+
+        # --- Phase 3: step up -> drain moves ingest entries into stable. ---
+        self.conn.reconfigure('disaggregated=(role="leader")')
+
+        self.conn.set_timestamp(
+            f'stable_timestamp={self.timestamp_str(oplog.last_timestamp())}')
+        follower_session.checkpoint()
+
+        # --- Phase 4: close everything, reopen as follower, verify. ---
+        follower_session.close()
+        self.conn.close('debug=(skip_checkpoint=true)')
+        self.conn = None
+
+        verify_conn = self.wiredtiger_open(self.home, self.conn_follower_config)
+        verify_session = verify_conn.open_session('')
+
+        oplog.check(self, verify_session, 0, total)
+
+        verify_session.close()
+        verify_conn.close()
+
+    # -----------------------------------------------------------------------
+    # Test 10: Multiple prepared keys that all land in the SAME drain range.
+    #
+    # Uses string keys (key_format=S) so that lexicographic ordering governs
+    # range subdivision, matching how __layered_key_cmp compares keys byte-
+    # by-byte.
+    #
+    # With drain_threads=8 (the default) the drain planner samples up to
+    # num_samples=64 committed drainable keys.  Exactly four committed keys
+    # are written ("300", "500", "700", "900"), all four land in the reservoir,
+    # and after lexicographic sorting they form the complete sample set.
+    #
+    #   n_splits = min(drain_threads - 1, key_count / 2)
+    #            = min(7, 4 / 2) = min(7, 2) = 2
+    #
+    #   Split 0: sample[4 * 1 / 3] = sample[1] = "500"
+    #   Split 1: sample[4 * 2 / 3] = sample[2] = "700"
+    #
+    # Resulting ranges:
+    #   Range 0: [unbounded, "500")
+    #   Range 1: ["500",     "700")
+    #   Range 2: ["700",     unbounded)
+    #
+    # All three prepared keys "100", "150", "200" are less than "500", so
+    # they all land in range 0 together.  This exercises the multi-key
+    # prepared redirect path within a SINGLE range worker — the path where
+    # __layered_fix_prepared_transaction is called multiple times for
+    # different keys by the same worker in the same range.
+    # -----------------------------------------------------------------------
+
+    def test_drain_multiple_prepared_same_range(self):
+        """
+        Verify that multiple prepared-transaction keys falling in the same
+        drain range are all correctly redirected (stable-btree pointer fixed)
+        by the single range-0 worker.
+
+        Key layout (string keys, lexicographic order):
+          Baseline  (leader, ts=1):        "000" -> "baseline"
+          Committed drainable (follower):  "300"@ts=10, "500"@ts=11,
+                                           "700"@ts=12, "900"@ts=13
+          Prepared  (prepared_id=1):       "100", "150", "200"
+                                           (all < "500", all in range 0)
+
+        With 4 drainable committed keys and drain_threads=8 the planner
+        produces 2 split points ("500", "700").  All three prepared keys
+        are below "500" so they land together in range 0.  Committing or
+        rolling back the prepared transaction is governed by self.do_commit
+        (True/False), which is already parameterised by the class scenarios.
+        """
+        uri = 'layered:test_layered106_prep_multi_range'
+        self.session.create(uri, 'key_format=S,value_format=S')
+
+        # ------------------------------------------------------------------
+        # Step 1: Leader baseline.
+        # Insert "000"="baseline" at ts=1 and checkpoint, establishing
+        # last_checkpoint_timestamp=1.  All subsequent follower writes use
+        # ts > 1 so they satisfy the drain filter (durable_start_ts > 1).
+        # ------------------------------------------------------------------
+        baseline_cursor = self.session.open_cursor(uri)
+        self.session.begin_transaction()
+        baseline_cursor.set_key('000')
+        baseline_cursor.set_value('baseline')
+        baseline_cursor.insert()
+        self.session.commit_transaction(
+            f'commit_timestamp={self.timestamp_str(1)}')
+        baseline_cursor.close()
+        self.conn.set_timestamp(f'stable_timestamp={self.timestamp_str(1)}')
+        self.session.checkpoint()
+
+        # ------------------------------------------------------------------
+        # Step 2: Step down to follower role.
+        # ------------------------------------------------------------------
+        self.conn.reconfigure('disaggregated=(role="follower")')
+
+        # ------------------------------------------------------------------
+        # Step 3: Follower committed writes.
+        # Four keys at explicit timestamps (not via oplog) to deterministically
+        # control the sample set and therefore the range split points.
+        # ------------------------------------------------------------------
+        follower_session = self.conn.open_session('')
+        follower_cursor = follower_session.open_cursor(uri)
+
+        committed = [
+            ('300', 'v300', 10),
+            ('500', 'v500', 11),
+            ('700', 'v700', 12),
+            ('900', 'v900', 13),
+        ]
+        for key, val, ts in committed:
+            follower_session.begin_transaction()
+            follower_cursor.set_key(key)
+            follower_cursor.set_value(val)
+            follower_cursor.insert()
+            follower_session.commit_transaction(
+                f'commit_timestamp={self.timestamp_str(ts)}')
+        follower_cursor.close()
+
+        # ------------------------------------------------------------------
+        # Step 4: Prepared transaction.
+        # All three prepared keys are inserted in a single transaction before
+        # prepare_transaction is called, so they share prepared_id=1 and all
+        # land in range 0 together during drain.
+        # ------------------------------------------------------------------
+        prepare_session = self.conn.open_session('')
+        prepare_cursor = prepare_session.open_cursor(uri)
+        prepare_session.begin_transaction()
+        for key, val in [('100', 'prep100'), ('150', 'prep150'), ('200', 'prep200')]:
+            prepare_cursor.set_key(key)
+            prepare_cursor.set_value(val)
+            prepare_cursor.insert()
+        prepare_session.prepare_transaction(
+            f'prepare_timestamp={self.timestamp_str(200)},'
+            f'prepared_id={self.prepared_id_str(1)}')
+        prepare_cursor.close()
+
+        # ------------------------------------------------------------------
+        # Step 5: Advance stable_timestamp to cover the prepare timestamp.
+        # ------------------------------------------------------------------
+        self.conn.set_timestamp(f'stable_timestamp={self.timestamp_str(200)}')
+
+        # ------------------------------------------------------------------
+        # Step 6: Step up to leader — drain runs.
+        # The range-0 worker owns [unbounded, "500") and encounters keys
+        # "100", "150", "200" in that range.  It calls
+        # __layered_fix_prepared_transaction for each, redirecting the
+        # prepared session's btree pointer from ingest to stable.
+        # ------------------------------------------------------------------
+        self.conn.reconfigure('disaggregated=(role="leader")')
+
+        # ------------------------------------------------------------------
+        # Step 7: Resolve the prepared transaction after drain completes.
+        # ------------------------------------------------------------------
+        if self.do_commit:
+            prepare_session.commit_transaction(
+                f'commit_timestamp={self.timestamp_str(300)},'
+                f'durable_timestamp={self.timestamp_str(300)}')
+        else:
+            prepare_session.rollback_transaction(
+                f'rollback_timestamp={self.timestamp_str(300)}')
+
+        # ------------------------------------------------------------------
+        # Step 8: Close the prepare session.
+        # ------------------------------------------------------------------
+        prepare_session.close()
+
+        # ------------------------------------------------------------------
+        # Step 9: Advance stable_timestamp and checkpoint.
+        # ------------------------------------------------------------------
+        self.conn.set_timestamp(f'stable_timestamp={self.timestamp_str(300)}')
+        follower_session.checkpoint()
+
+        # ------------------------------------------------------------------
+        # Step 10: Verify.
+        # ------------------------------------------------------------------
+        read_session = self.conn.open_session('')
+        read_cursor = read_session.open_cursor(uri)
+
+        # Baseline key must always be present (written as leader, never drained).
+        self._verify_key(read_session, read_cursor, '000',
+                         ts_read=1, expect_value='baseline')
+
+        # Four committed keys must be visible after drain (drained from ingest).
+        for key, val, _ in committed:
+            self._verify_key(read_session, read_cursor, key,
+                             ts_read=200, expect_value=val)
+
+        # Three prepared keys: present with correct values on commit, absent on rollback.
+        for key, val in [('100', 'prep100'), ('150', 'prep150'), ('200', 'prep200')]:
+            expected = val if self.do_commit else None
+            self._verify_key(read_session, read_cursor, key,
+                             ts_read=300, expect_value=expected)
+
+        # ------------------------------------------------------------------
+        # Step 11: Cleanup.
+        # ------------------------------------------------------------------
+        read_cursor.close()
+        read_session.close()
+
+    # -----------------------------------------------------------------------
+    # Test 11: Single drainable key — no range subdivision.
+    #
+    # With n_collected=1 the sampling function computes n_splits=0 and the
+    # table gets one unbounded work item regardless of drain_threads.
+    # -----------------------------------------------------------------------
+
+    def test_drain_tiny_ingest(self):
+        """
+        A single drainable key in the ingest exercises the no-split path
+        through the parallel-drain machinery.  With any drain_threads > 1
+        n_splits = n_collected / 2 = 0 so the table receives one unbounded
+        work item — the same code path as single-thread mode but reached via
+        the sampling gate rather than the thread-count gate.
+
+        Uses the single-connection follower->leader pattern; no
+        disagg_advance_checkpoint is needed.
+        """
+        uri = 'layered:test_layered106_tiny'
+        n_stable = 10
+
+        oplog = Oplog()
+        t = oplog.add_uri(uri)
+
+        # Leader: write a small stable baseline and checkpoint to set
+        # last_checkpoint_timestamp, so the single ingest key below will
+        # have durable_start_ts > last_checkpoint_timestamp and be drained.
+        oplog.insert(t, n_stable)
+        self.session.create(uri, 'key_format=S,value_format=S')
+        oplog.apply(self, self.session, 0, n_stable)
+        self.conn.set_timestamp(
+            f'stable_timestamp={self.timestamp_str(oplog.last_timestamp())}')
+        self.session.checkpoint()
+
+        # Step down; subsequent write goes to the ingest btree.
+        self.conn.reconfigure('disaggregated=(role="follower")')
+        follower_session = self.conn.open_session('')
+
+        # Insert exactly 1 key (multiplier NOT used — smallness is intentional).
+        oplog.insert(t, 1)
+        oplog.apply(self, follower_session, n_stable, 1)
+
+        # Step up; drain creates one unbounded work item and moves the key.
+        self.conn.reconfigure('disaggregated=(role="leader")')
+
+        total = n_stable + 1
+        self.conn.set_timestamp(
+            f'stable_timestamp={self.timestamp_str(oplog.last_timestamp())}')
+        follower_session.checkpoint()
+        follower_session.close()
+
+        # Verify on the existing leader connection — no reopen needed.
+        verify_session = self.conn.open_session('')
+        oplog.check(self, verify_session, 0, total)
+        verify_session.close()
+
+    # -----------------------------------------------------------------------
+    # Test 12: Two complete follower->leader drain cycles on the same table.
+    #
+    # After cycle 1 the ingest is cleared and last_checkpoint_timestamp is
+    # advanced.  Cycle 2's ingest writes have timestamps above that new
+    # last_checkpoint_timestamp, so they are drainable on the second step-up.
+    # Both batches must be readable after the second drain.
+    # -----------------------------------------------------------------------
+
+    def test_drain_multiple_step_up_cycles(self):
+        """
+        Two full follower->leader transitions on the same table verify that
+        the ingest is properly cleared after the first drain and that the
+        second drain does not re-drain or lose data from the first cycle.
+
+        Uses the single-connection follower->leader pattern; no
+        disagg_advance_checkpoint is needed.
+        """
+        uri = 'layered:test_layered106_multi_cycle'
+        n_batch = 50 * self.multiplier
+
+        oplog = Oplog()
+        t = oplog.add_uri(uri)
+
+        # --- Stable baseline (batch 1) ---
+        oplog.insert(t, n_batch)
+        self.session.create(uri, 'key_format=S,value_format=S')
+        oplog.apply(self, self.session, 0, n_batch)
+        self.conn.set_timestamp(
+            f'stable_timestamp={self.timestamp_str(oplog.last_timestamp())}')
+        self.session.checkpoint()
+
+        # --- Cycle 1: step down, write batch 2, step up ---
+        self.conn.reconfigure('disaggregated=(role="follower")')
+        oplog.insert(t, n_batch)
+        session_c1 = self.conn.open_session('')
+        oplog.apply(self, session_c1, n_batch, n_batch)
+
+        self.conn.reconfigure('disaggregated=(role="leader")')
+        # Checkpoint advances last_checkpoint_timestamp so cycle 2's batch is
+        # drainable (its timestamps are strictly above this stable_timestamp).
+        self.conn.set_timestamp(
+            f'stable_timestamp={self.timestamp_str(oplog.last_timestamp())}')
+        session_c1.checkpoint()
+        session_c1.close()
+
+        # --- Cycle 2: step down, write batch 3, step up ---
+        self.conn.reconfigure('disaggregated=(role="follower")')
+        oplog.insert(t, n_batch)
+        session_c2 = self.conn.open_session('')
+        oplog.apply(self, session_c2, 2 * n_batch, n_batch)
+
+        self.conn.reconfigure('disaggregated=(role="leader")')
+        self.conn.set_timestamp(
+            f'stable_timestamp={self.timestamp_str(oplog.last_timestamp())}')
+        session_c2.checkpoint()
+        session_c2.close()
+
+        # Verify all three batches visible on the current leader connection.
+        verify_session = self.conn.open_session('')
+        oplog.check(self, verify_session, 0, 3 * n_batch)
+        verify_session.close()
+
 if __name__ == '__main__':
     wttest.run()
