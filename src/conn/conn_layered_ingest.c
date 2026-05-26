@@ -545,23 +545,17 @@ __layered_copy_ingest_table(WT_SESSION_IMPL *session, const char *ingest_uri,
 
     /*
      * If a start key is supplied, position the version cursor at key_start using an exact search.
-     * Split keys are sampled from the same version cursor (same start_timestamp filter) used during
-     * drain, so key_start is guaranteed to be a drainable key. WT_NOTFOUND is therefore a
-     * defensive-only path: it would only fire if a concurrent operation removed the key between
-     * sampling and drain. Treat it as nothing to drain for this range.
+     * Split keys are sampled using the same version cursor configuration (same start_timestamp
+     * filter) as the drain workers, and the checkpoint lock is held across both sampling and drain,
+     * so last_checkpoint_timestamp cannot advance between the two phases. Every split key is
+     * therefore guaranteed to be present and drainable; WT_NOTFOUND is an invariant violation.
      */
     if (key_start != NULL) {
         ingest_version_cursor->set_key(ingest_version_cursor, key_start);
-        WT_ERR_NOTFOUND_OK(ingest_version_cursor->search(ingest_version_cursor), true);
-        if (ret == WT_NOTFOUND) {
-            __layered_key_hex(key_start, hex1, sizeof(hex1));
-            __layered_key_hex(key_stop != NULL ? key_stop : &(WT_ITEM){0}, hex2, sizeof(hex2));
-            __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
-              "Drain range position: table=%s start=%s stop=%s search=not_found", ingest_uri, hex1,
-              hex2);
-            ret = 0;
-            goto err;
-        }
+        ret = ingest_version_cursor->search(ingest_version_cursor);
+        WT_ASSERT_ALWAYS(session, ret != WT_NOTFOUND,
+          "Drain range start key not found: checkpoint_lock must be held across sampling and drain");
+        WT_ERR(ret);
         skip_first_next = true;
     }
 
@@ -595,7 +589,7 @@ __layered_copy_ingest_table(WT_SESSION_IMPL *session, const char *ingest_uri,
             if (cmp >= 0) {
                 __layered_key_hex(tmp_key, hex1, sizeof(hex1));
                 __layered_key_hex(key_stop, hex2, sizeof(hex2));
-                __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
+                __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_DEBUG_1,
                   "Drain range stop_boundary: table=%s at=%s stop=%s", ingest_uri, hex1, hex2);
                 if (upds != NULL) {
                     WT_WITH_DHANDLE(session, cbt->dhandle,
@@ -764,7 +758,7 @@ err:
     if (*nkeysp > 0) {
         __layered_key_hex(first_key, hex1, sizeof(hex1));
         __layered_key_hex(key, hex2, sizeof(hex2));
-        __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
+        __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_DEBUG_1,
           "Drain range extent: table=%s keys=%" PRIu64 " first=%s last=%s", ingest_uri, *nkeysp,
           hex1, hex2);
     }
@@ -946,7 +940,7 @@ __layered_drain_worker_run(WT_SESSION_IMPL *session, WT_THREAD *ctx)
 
     __layered_key_hex(&work_item->key_start, start_preview, sizeof(start_preview));
     __layered_key_hex(&work_item->key_stop, stop_preview, sizeof(stop_preview));
-    __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
+    __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_DEBUG_1,
       "Drain range begin: table=%s range=%" PRIu32 "/%" PRIu32 " start=%s stop=%s", ingest_uri,
       work_item->range_index, ts->total_ranges, start_preview, stop_preview);
 
@@ -964,7 +958,7 @@ __layered_drain_worker_run(WT_SESSION_IMPL *session, WT_THREAD *ctx)
             (void)__wt_atomic_add_uint64(&conn->layered_drain_data.total_keys_drained, nkeys);
     }
 
-    __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
+    __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_DEBUG_1,
       "Drain range finish: table=%s range=%" PRIu32 "/%" PRIu32 " keys=%" PRIu64 "%s", ingest_uri,
       work_item->range_index, ts->total_ranges, nkeys, ret != 0 ? " (error)" : "");
 
@@ -973,7 +967,7 @@ __layered_drain_worker_run(WT_SESSION_IMPL *session, WT_THREAD *ctx)
         if (__wt_atomic_load_uint32_relaxed(&ts->error) == 0) {
             uint64_t t_trunc = __wt_clock(session);
             WT_TRET(__layered_clear_ingest_table(session, ingest_uri));
-            __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
+            __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_DEBUG_1,
               "Drain truncate: table=%s truncate_ms=%" PRIu64, ingest_uri,
               WT_CLOCKDIFF_MS(__wt_clock(session), t_trunc));
 #ifdef HAVE_DIAGNOSTIC
@@ -1318,7 +1312,7 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
         {
             uint64_t sampling_ms = WT_CLOCKDIFF_MS(__wt_clock(session), t_sample_start);
             total_sampling_ms += sampling_ms;
-            __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
+            __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_DEBUG_1,
               "Drain table audit: table=%s drainable_keys=%" PRIu64 " sampling_ms=%" PRIu64,
               e->ingest_uri, sampled_keys, sampling_ms);
         }
@@ -1366,7 +1360,7 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
                 char stop_preview[WT_LAYERED_KEY_HEX_BUFSIZE];
                 __layered_key_hex(&work_item->key_start, start_preview, sizeof(start_preview));
                 __layered_key_hex(&work_item->key_stop, stop_preview, sizeof(stop_preview));
-                __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_NOTICE,
+                __wt_verbose_level(session, WT_VERB_LAYERED, WT_VERBOSE_DEBUG_1,
                   "Drain range queued: table=%s range=%" PRIu32 "/%" PRIu32 " start=%s stop=%s",
                   e->ingest_uri, (uint32_t)j, ts->total_ranges, start_preview, stop_preview);
             }
