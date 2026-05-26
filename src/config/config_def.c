@@ -4414,7 +4414,7 @@ static const WT_CONFIG_ENTRY config_entries[] = {
     "local_files_action=delete,lose_all_my_data=false,page_log=,"
     "role=),ingest=,key_format=u,log=(enabled=true),stable=,"
     "value_format=u,verbose=[],write_timestamp_usage=none",
-    confchk_layered_meta, 12, confchk_layered_meta_jump, 48, WT_CONF_SIZING_NONE, false},
+    confchk_layered_meta, 12, confchk_layered_meta_jump, 49, WT_CONF_SIZING_NONE, false},
   {"object.meta",
     "access_pattern_hint=none,allocation_size=4KB,app_metadata=,"
     "assert=(commit_timestamp=none,durable_timestamp=none,"
