@@ -1049,5 +1049,100 @@ class test_layered106(wttest.WiredTigerTestCase):
         read_session.close()
 
 
+    def test_drain_range_truncate_ingest_and_stable_keys(self):
+        """
+        Verify that __layered_apply_truncate_to_stable skips keys that were
+        already tombstoned by the ingest drain (keys present in both the ingest
+        and stable btrees), preventing duplicate tombstones.
+
+        Scenario:
+          T=10  (leader)   write k1, k2 → checkpoint → both stable-only
+          T=20  (follower) write k2 into ingest (k2 now in both ingest+stable)
+          T=30  (follower) truncate [k1..k2]:
+                             k1 is stable-only → WT_TRUNCATE entry only (no ingest tombstone)
+                             k2 is in ingest   → tombstone at T=30 written to ingest +
+                                                 WT_TRUNCATE entry queued
+          step-up:
+            ingest drain copies k2 tombstone@T=30 to stable
+            __layered_apply_truncate_to_stable opens cursors at read_timestamp=T_trunc:
+              k2 appears deleted (ingest tombstone) → skipped (no duplicate tombstone)
+              k1 still visible                      → tombstoned correctly
+        """
+        uri = 'layered:test_layered106_trunc_ingest_stable_keys'
+
+        # --- Leader phase ---
+        self.session.create(uri, 'key_format=S,value_format=S')
+        cursor = self.session.open_cursor(uri)
+        for k, v in (('k1', 'v1_orig'), ('k2', 'v2_orig')):
+            self.session.begin_transaction()
+            cursor.set_key(k)
+            cursor.set_value(v)
+            cursor.insert()
+            self.session.commit_transaction(f'commit_timestamp={self.timestamp_str(10)}')
+        cursor.close()
+        self.conn.set_timestamp(f'stable_timestamp={self.timestamp_str(10)}'
+                                f',oldest_timestamp={self.timestamp_str(1)}')
+        self.session.checkpoint()
+
+        # --- Step down ---
+        self.conn.reconfigure('disaggregated=(role="follower")')
+
+        fsession = self.conn.open_session('')
+
+        # T=20: write k2 into ingest — k2 is now in both stable and ingest.
+        fcursor = fsession.open_cursor(uri)
+        fsession.begin_transaction()
+        fcursor.set_key('k2')
+        fcursor.set_value('v2_ingest')
+        fcursor.update()
+        fsession.commit_transaction(f'commit_timestamp={self.timestamp_str(20)}')
+        fcursor.close()
+
+        # T=30: truncate [k1..k2].
+        #   k1 stable-only → WT_TRUNCATE entry only.
+        #   k2 in ingest   → tombstone written to ingest at T=30 + WT_TRUNCATE entry.
+        c_start = fsession.open_cursor(uri)
+        c_stop  = fsession.open_cursor(uri)
+        c_start.set_key('k1')
+        c_stop.set_key('k2')
+        fsession.begin_transaction()
+        fsession.truncate(None, c_start, c_stop, None)
+        fsession.commit_transaction(f'commit_timestamp={self.timestamp_str(30)}')
+        c_start.close()
+        c_stop.close()
+
+        self.conn.set_timestamp(f'stable_timestamp={self.timestamp_str(30)}')
+
+        # --- Step up and drain ---
+        self.conn.reconfigure('disaggregated=(role="leader")')
+        fsession.checkpoint()
+        fsession.close()
+
+        # --- Verify MVCC chain ---
+        rsession = self.conn.open_session('')
+
+        def read_key(ts, key):
+            rsession.begin_transaction(f'read_timestamp={self.timestamp_str(ts)}')
+            rc = rsession.open_cursor(uri)
+            rc.set_key(key)
+            ret = rc.search()
+            val = rc.get_value() if ret == 0 else None
+            rsession.rollback_transaction()
+            rc.close()
+            return ret, val
+
+        # k1: stable-only; tombstoned by __layered_apply_truncate_to_stable at T=30.
+        self.assertEqual(read_key(29, 'k1'), (0, 'v1_orig'), 'k1 visible before truncate')
+        self.assertEqual(read_key(30, 'k1')[0], wiredtiger.WT_NOTFOUND, 'k1 absent at truncate ts')
+
+        # k2: tombstoned by ingest drain at T=30; __layered_apply_truncate_to_stable
+        # must skip it (no duplicate tombstone).
+        self.assertEqual(read_key(19, 'k2'), (0, 'v2_orig'),   'k2 at T=19: original stable value')
+        self.assertEqual(read_key(25, 'k2'), (0, 'v2_ingest'), 'k2 at T=25: ingest write visible')
+        self.assertEqual(read_key(30, 'k2')[0], wiredtiger.WT_NOTFOUND, 'k2 absent at truncate ts')
+
+        rsession.close()
+
+
 if __name__ == '__main__':
     wttest.run()

@@ -1062,17 +1062,26 @@ __layered_find_pin_ingest_dhandle(
  *     Replay a single committed follower truncate against the stable btree. Opens start/stop cursors
  *     on the stable URI, installs the txn/ts context from the truncate entry, and issues a range
  *     truncate using the INGEST_REPLAY path so that tombstones carry the original timestamps.
+ *
+ *     The cursors are opened with read_timestamp=start_ts so that keys already tombstoned at
+ *     start_ts by the ingest drain (because those keys existed in the ingest btree) appear deleted
+ *     and are skipped. Only stable-only keys — never written to ingest — remain visible at
+ *     start_ts and receive a tombstone here.
  */
 static int
 __layered_apply_truncate_to_stable(WT_SESSION_IMPL *session, WT_TRUNCATE *t)
 {
     WT_CURSOR *trunc_start, *trunc_stop;
     WT_DECL_RET;
-    const char *open_cfg[] = {WT_CONFIG_BASE(session, WT_SESSION_open_cursor), "raw=true", NULL};
+    char ts_cfg[64];
+    const char *open_cfg[] = {
+      WT_CONFIG_BASE(session, WT_SESSION_open_cursor), "raw=true", ts_cfg, NULL};
 
     WT_ASSERT(session, t->start_key.size > 0 && t->stop_key.size > 0);
     WT_ASSERT(session, t->start_ts > WT_TS_NONE);
     WT_ASSERT(session, t->durable_ts >= t->start_ts);
+
+    WT_RET(__wt_snprintf(ts_cfg, sizeof(ts_cfg), "read_timestamp=%" PRIx64, t->start_ts));
 
     trunc_start = trunc_stop = NULL;
     WT_ERR(
