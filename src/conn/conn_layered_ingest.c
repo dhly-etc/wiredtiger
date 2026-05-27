@@ -231,7 +231,6 @@ __layered_derive_stable_uri(WT_SESSION_IMPL *session, const char *ingest_uri, WT
     return (__wt_buf_fmt(session, buf, "%.*s.wt_stable", (int)prefix_len, ingest_uri));
 }
 
-#ifdef HAVE_UNITTEST
 /*
  * __layered_derive_layered_uri --
  *     Derive the parent layered URI from a constituent ingest URI.
@@ -252,7 +251,6 @@ __layered_derive_layered_uri(WT_SESSION_IMPL *session, const char *ingest_uri, W
     size_t name_len = uri_len - prefix_len - suffix_len;
     return (__wt_buf_fmt(session, buf, "layered:%.*s", (int)name_len, ingest_uri + prefix_len));
 }
-#endif
 
 #ifdef HAVE_DIAGNOSTIC
 /*
@@ -1060,6 +1058,88 @@ __layered_find_pin_ingest_dhandle(
 }
 
 /*
+ * __layered_apply_truncate_to_stable --
+ *     Replay a single committed follower truncate against the stable btree. Opens start/stop cursors
+ *     on the stable URI, installs the txn/ts context from the truncate entry, and issues a range
+ *     truncate using the INGEST_REPLAY path so that tombstones carry the original timestamps.
+ */
+static int
+__layered_apply_truncate_to_stable(WT_SESSION_IMPL *session, WT_TRUNCATE *t)
+{
+    WT_CURSOR *trunc_start, *trunc_stop;
+    WT_DECL_RET;
+    const char *open_cfg[] = {WT_CONFIG_BASE(session, WT_SESSION_open_cursor), "raw=true", NULL};
+
+    WT_ASSERT(session, t->start_key.size > 0 && t->stop_key.size > 0);
+    WT_ASSERT(session, t->start_ts > WT_TS_NONE);
+    WT_ASSERT(session, t->durable_ts >= t->start_ts);
+
+    trunc_start = trunc_stop = NULL;
+    WT_ERR(
+      __wt_open_cursor(session, t->layered_table->stable_uri, NULL, open_cfg, &trunc_start));
+    WT_ERR(
+      __wt_open_cursor(session, t->layered_table->stable_uri, NULL, open_cfg, &trunc_stop));
+
+    trunc_start->set_key(trunc_start, &t->start_key);
+    trunc_stop->set_key(trunc_stop, &t->stop_key);
+
+    session->replay_trunc_ctx.txn_id = t->txn_id;
+    session->replay_trunc_ctx.commit_ts = t->start_ts;
+    session->replay_trunc_ctx.durable_ts = t->durable_ts;
+
+    F_SET(session, WT_SESSION_INGEST_REPLAY);
+    ret = __wt_session_range_truncate(session, NULL, trunc_start, trunc_stop);
+    F_CLR(session, WT_SESSION_INGEST_REPLAY);
+
+err:
+    if (trunc_start != NULL)
+        WT_TRET(trunc_start->close(trunc_start));
+    if (trunc_stop != NULL)
+        WT_TRET(trunc_stop->close(trunc_stop));
+    return (ret);
+}
+
+/*
+ * __layered_apply_and_clear_truncates --
+ *     After all ingest ranges for a table have been drained, apply every committed follower truncate
+ *     from the truncate list to the stable btree (covering keys that only exist in stable and were
+ *     never in the ingest btree), then clear the list. Must be called once per table after all
+ *     parallel drain workers for that table have finished.
+ */
+static int
+__layered_apply_and_clear_truncates(WT_SESSION_IMPL *session, const char *layered_uri)
+{
+    WT_DATA_HANDLE *layered_dhandle;
+    WT_DECL_RET;
+    WT_LAYERED_TABLE *layered_table;
+    WT_TRUNCATE *t;
+
+    layered_dhandle = NULL;
+
+    WT_RET_ERROR_OK(
+      ret = __wt_session_get_dhandle(session, layered_uri, NULL, NULL, 0), ENOENT);
+    if (ret == ENOENT)
+        return (0);
+    layered_dhandle = session->dhandle;
+    layered_table = (WT_LAYERED_TABLE *)layered_dhandle;
+
+    __wt_readlock(session, &layered_table->truncate_lock);
+    TAILQ_FOREACH (t, &layered_table->truncateqh, q) {
+        if (!__wt_atomic_load_bool_relaxed(&t->committed))
+            continue;
+        __wt_readunlock(session, &layered_table->truncate_lock);
+        WT_TRET(__layered_apply_truncate_to_stable(session, t));
+        __wt_readlock(session, &layered_table->truncate_lock);
+    }
+    __wt_readunlock(session, &layered_table->truncate_lock);
+
+    __wt_layered_table_truncate_clear(session, layered_table);
+
+    WT_WITH_DHANDLE(session, layered_dhandle, WT_TRET(__wt_session_release_dhandle(session)));
+    return (ret);
+}
+
+/*
  * __layered_drain_clear_work_queue --
  *     Clear the work queue for ingest table drain.
  */
@@ -1278,6 +1358,21 @@ err:
         __wt_writelock(session, &conn->layered_drain_data.threads.lock);
         WT_TRET(__wt_thread_group_destroy(session, &conn->layered_drain_data.threads));
     }
+    /*
+     * Apply committed follower truncates to the stable btree and clear the truncate list for every
+     * table, including tables whose ingest btree was empty (and therefore skipped above). Keys that
+     * only exist in stable — never written to the ingest btree — are not covered by ingest
+     * tombstones; the explicit range truncate replay is the only path that stamps them deleted.
+     */
+    if (entries != NULL) {
+        for (i = 0; i < table_count; i++) {
+            WT_LAYERED_TABLE_MANAGER_ENTRY *e = entries[i];
+            if (e == NULL)
+                continue;
+            WT_TRET(__layered_apply_and_clear_truncates(session, e->layered_uri));
+        }
+    }
+
     bytes_after = WT_STAT_CONN_READ(conn->stats, block_byte_read);
     {
         uint64_t t_now = __wt_clock(session);

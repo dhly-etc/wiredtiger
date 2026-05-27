@@ -957,5 +957,97 @@ class test_layered106(wttest.WiredTigerTestCase):
         oplog.check(self, verify_session, 0, 3 * n_batch)
         verify_session.close()
 
+    # -----------------------------------------------------------------------
+    # Test 13: Follower range-truncate of stable-only keys is correctly drained.
+    #
+    # Scenario:
+    #   - Leader writes keys k1..k3 and checkpoints them into the stable btree.
+    #   - Node becomes follower; the ingest btree is empty.
+    #   - Follower issues a range truncate covering k1..k3.
+    #     Because k1..k3 are not in the ingest btree, __clayered_range_truncate
+    #     adds a WT_TRUNCATE list entry (to hide the keys on reads) but writes
+    #     NO tombstone into the ingest btree.
+    #   - Also writes a fresh key k4 (only in ingest) to prove normal drain
+    #     still works alongside truncate replay.
+    #   - Step up to leader: drain must apply the WT_TRUNCATE list entry to the
+    #     stable btree so k1..k3 get tombstoned, then clear the truncate list.
+    #   - Verify k1..k3 absent, k4 present.
+    # -----------------------------------------------------------------------
+
+    def test_drain_range_truncate_stable_only_keys(self):
+        """
+        Verify that a follower range truncate covering keys that exist only in the
+        stable btree (no ingest btree counterpart) is correctly replayed against
+        stable during drain, leaving those keys absent after step-up.
+        """
+        uri = 'layered:test_layered106_trunc_stable'
+
+        # --- Leader phase: write three keys into stable. ---
+        self.session.create(uri, 'key_format=S,value_format=S')
+        cursor = self.session.open_cursor(uri)
+        for k in ('k1', 'k2', 'k3'):
+            self.session.begin_transaction()
+            cursor.set_key(k)
+            cursor.set_value(f'v_{k}')
+            cursor.insert()
+            self.session.commit_transaction(f'commit_timestamp={self.timestamp_str(10)}')
+        cursor.close()
+        self.conn.set_timestamp(f'stable_timestamp={self.timestamp_str(10)}'
+                                f',oldest_timestamp={self.timestamp_str(1)}')
+        self.session.checkpoint()
+
+        # --- Step down to follower. k1..k3 are now stable-only. ---
+        self.conn.reconfigure('disaggregated=(role="follower")')
+
+        follower_session = self.conn.open_session('')
+        follower_cursor = follower_session.open_cursor(uri)
+
+        # Range truncate k1..k3.  Because none of these keys are in the ingest
+        # btree, __clayered_range_truncate only adds a WT_TRUNCATE list entry
+        # and writes no tombstone into the ingest btree.
+        c_start = follower_session.open_cursor(uri)
+        c_stop  = follower_session.open_cursor(uri)
+        c_start.set_key('k1')
+        c_stop.set_key('k3')
+        follower_session.begin_transaction()
+        follower_session.truncate(None, c_start, c_stop, None)
+        follower_session.commit_transaction(f'commit_timestamp={self.timestamp_str(20)}')
+        c_start.close()
+        c_stop.close()
+
+        # Also insert a fresh key k4 (only in ingest) to verify normal drain.
+        follower_session.begin_transaction()
+        follower_cursor.set_key('k4')
+        follower_cursor.set_value('v_k4')
+        follower_cursor.insert()
+        follower_session.commit_transaction(f'commit_timestamp={self.timestamp_str(21)}')
+        follower_cursor.close()
+
+        self.conn.set_timestamp(f'stable_timestamp={self.timestamp_str(21)}')
+
+        # --- Step up: drain must replay the WT_TRUNCATE against stable. ---
+        self.conn.reconfigure('disaggregated=(role="leader")')
+        follower_session.checkpoint()
+        follower_session.close()
+
+        # --- Verify. ---
+        read_session = self.conn.open_session('')
+        read_cursor = read_session.open_cursor(uri)
+        read_session.begin_transaction(f'read_timestamp={self.timestamp_str(21)}')
+
+        for k in ('k1', 'k2', 'k3'):
+            read_cursor.set_key(k)
+            self.assertEqual(read_cursor.search(), wiredtiger.WT_NOTFOUND,
+                f'{k} should be absent after truncate drain')
+
+        read_cursor.set_key('k4')
+        self.assertEqual(read_cursor.search(), 0, 'k4 should be present after drain')
+        self.assertEqual(read_cursor.get_value(), 'v_k4')
+
+        read_session.rollback_transaction()
+        read_cursor.close()
+        read_session.close()
+
+
 if __name__ == '__main__':
     wttest.run()
