@@ -932,18 +932,42 @@ __clayered_truncate_follower(WT_TRUNCATE_INFO *trunc_info)
  * __clayered_stable_replay_remove_int --
  *     Per-key delete function for ingest truncate replay. Allocates a pre-stamped tombstone and
  *     inserts it directly via __wt_row_modify, bypassing the session transaction entirely.
+ *
+ *     Resurrection guard: if drain already appended a WT_UPDATE_RESTORED_FROM_INGEST tombstone at
+ *     the truncation timestamp (the "Fix D" path for keys that were stable-only at truncation time
+ *     but later reinserted to ingest), skip inserting a second tombstone here. A second tombstone
+ *     at HEAD would invert the MVCC chain and trigger a reconciler assertion.
  */
 static int
 __clayered_stable_replay_remove_int(WT_CURSOR_BTREE *cbt, const WT_ITEM *value, u_int modify_type)
 {
     WT_DECL_RET;
+    WT_PAGE *page;
     WT_SESSION_IMPL *session;
-    WT_UPDATE *upd;
+    WT_UPDATE *u, *upd;
 
     WT_UNUSED(value);
     WT_UNUSED(modify_type);
 
     session = CUR2S(cbt);
+    page = cbt->ref->page;
+
+    /*
+     * Check whether the ingest drain already placed a resurrection tombstone at this truncation
+     * timestamp. The drain appends such tombstones with WT_UPDATE_RESTORED_FROM_INGEST to signal
+     * that the key was stable-only at truncation time and was later reinserted above the truncation
+     * timestamp. Inserting another tombstone here would prepend it at HEAD before the reinserted
+     * value, creating an inverted chain [tomb@T_trunc, write@T_y, ...] that fires the reconciler
+     * assertion upd_select->tw.stop_ts == 0.
+     */
+    u = cbt->ins != NULL ? cbt->ins->upd :
+      (page->modify != NULL ? page->modify->mod_row_update[cbt->slot] : NULL);
+    for (; u != NULL; u = u->next) {
+        if (u->type == WT_UPDATE_TOMBSTONE && F_ISSET(u, WT_UPDATE_RESTORED_FROM_INGEST) &&
+          u->upd_start_ts == session->replay_trunc_ctx.commit_ts)
+            return (0);
+    }
+
     WT_RET(__wt_upd_alloc(session, NULL, WT_UPDATE_TOMBSTONE, &upd, NULL));
     upd->txnid = session->replay_trunc_ctx.txn_id;
     upd->upd_start_ts = session->replay_trunc_ctx.commit_ts;
