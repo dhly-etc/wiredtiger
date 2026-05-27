@@ -1022,6 +1022,34 @@ err:
 }
 
 /*
+ * __layered_find_pin_ingest_dhandle --
+ *     Under the handle-list read lock, locate the open btree dhandle for the given URI and
+ *     increment its in-use count.  Called as the single op argument to
+ *     WT_WITH_HANDLE_LIST_READ_LOCK to avoid the GNU statement-expression extension.
+ */
+static void
+__layered_find_pin_ingest_dhandle(
+  WT_SESSION_IMPL *session, const char *uri, WT_DATA_HANDLE **dhp)
+{
+    WT_CONNECTION_IMPL *conn;
+    WT_DATA_HANDLE *dh;
+
+    conn = S2C(session);
+    *dhp = NULL;
+    for (dh = NULL;;) {
+        WT_DHANDLE_NEXT(session, dh, &conn->dhqh, q);
+        if (dh == NULL)
+            break;
+        if (WT_DHANDLE_BTREE(dh) && F_ISSET(dh, WT_DHANDLE_OPEN) &&
+          strcmp(dh->name, uri) == 0) {
+            WT_WITH_DHANDLE(session, dh, __wt_cursor_dhandle_incr_use(session));
+            *dhp = dh;
+            break;
+        }
+    }
+}
+
+/*
  * __layered_drain_clear_work_queue --
  *     Clear the work queue for ingest table drain.
  */
@@ -1153,20 +1181,8 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
         table_states[i] = ts;
 
         /* Pin the ingest dhandle once for this table; released when the last range finishes. */
-        WT_WITH_HANDLE_LIST_READ_LOCK(session, ({
-            WT_DATA_HANDLE *dh;
-            for (dh = NULL;;) {
-                WT_DHANDLE_NEXT(session, dh, &conn->dhqh, q);
-                if (dh == NULL)
-                    break;
-                if (WT_DHANDLE_BTREE(dh) && F_ISSET(dh, WT_DHANDLE_OPEN) &&
-                  strcmp(dh->name, e->ingest_uri) == 0) {
-                    WT_WITH_DHANDLE(session, dh, __wt_cursor_dhandle_incr_use(session));
-                    ts->ingest_dhandle = dh;
-                    break;
-                }
-            }
-        }));
+        WT_WITH_HANDLE_LIST_READ_LOCK(session,
+          __layered_find_pin_ingest_dhandle(session, e->ingest_uri, &ts->ingest_dhandle));
         if (ts->ingest_dhandle == NULL)
             WT_ERR_MSG(session, WT_NOTFOUND, "ingest dhandle not found for \"%s\"", e->ingest_uri);
 
