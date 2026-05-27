@@ -231,6 +231,7 @@ __layered_derive_stable_uri(WT_SESSION_IMPL *session, const char *ingest_uri, WT
     return (__wt_buf_fmt(session, buf, "%.*s.wt_stable", (int)prefix_len, ingest_uri));
 }
 
+#ifdef HAVE_UNITTEST
 /*
  * __layered_derive_layered_uri --
  *     Derive the parent layered URI from a constituent ingest URI.
@@ -251,6 +252,7 @@ __layered_derive_layered_uri(WT_SESSION_IMPL *session, const char *ingest_uri, W
     size_t name_len = uri_len - prefix_len - suffix_len;
     return (__wt_buf_fmt(session, buf, "layered:%.*s", (int)name_len, ingest_uri + prefix_len));
 }
+#endif
 
 #ifdef HAVE_DIAGNOSTIC
 /*
