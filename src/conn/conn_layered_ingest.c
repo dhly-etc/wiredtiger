@@ -395,6 +395,7 @@ static int
 __layered_fix_prepared_transaction(WT_SESSION_IMPL *session, WT_ITEM *key, WT_BTREE *ingest_btree,
   WT_BTREE *stable_btree, uint64_t txnid, uint64_t prepared_id)
 {
+    WT_DECL_RET;
     WT_FIX_PREPARED_COOKIE cookie;
 
     cookie.key = key;
@@ -403,8 +404,20 @@ __layered_fix_prepared_transaction(WT_SESSION_IMPL *session, WT_ITEM *key, WT_BT
     cookie.txnid = txnid;
     cookie.prepared_id = prepared_id;
 
-    return (
-      __wt_session_array_walk(session, __layered_fix_prepared_transaction_callback, true, &cookie));
+    /*
+     * Serialize across parallel drain workers. Each worker can independently encounter a key
+     * belonging to a still-in-flight prepared transaction and call into here -- the callback then
+     * walks every session in the connection and writes op->btree / op->u.op_upd->txnid for the
+     * matching op. Workers fix different ops (one per key) but they iterate the same txn->mod[]
+     * array, so an unguarded concurrent walk produces an unsynchronized read+write on each
+     * op->btree as workers scan past the other worker's op. The lock is held only across the
+     * walk; rare path, no measurable contention.
+     */
+    __wt_spin_lock(session, &S2C(session)->layered_drain_data.fix_prepared_lock);
+    ret =
+      __wt_session_array_walk(session, __layered_fix_prepared_transaction_callback, true, &cookie);
+    __wt_spin_unlock(session, &S2C(session)->layered_drain_data.fix_prepared_lock);
+    return (ret);
 }
 
 /* Buffer large enough for 255 bytes of key as hex plus NUL. */
@@ -1328,6 +1341,7 @@ __layered_drain_clear_work_queue(WT_SESSION_IMPL *session)
       "Layered drain work queue failed to drain");
     __wt_spin_unlock(session, &conn->layered_drain_data.queue_lock);
     __wt_spin_destroy(session, &conn->layered_drain_data.queue_lock);
+    __wt_spin_destroy(session, &conn->layered_drain_data.fix_prepared_lock);
 }
 
 /*
@@ -1395,6 +1409,8 @@ __wti_layered_drain_ingest_tables(WT_SESSION_IMPL *session)
     TAILQ_INIT(&conn->layered_drain_data.work_queue);
     WT_ERR(__wt_spin_init(
       session, &conn->layered_drain_data.queue_lock, "layered drain work queue lock"));
+    WT_ERR(__wt_spin_init(session, &conn->layered_drain_data.fix_prepared_lock,
+      "layered drain fix-prepared lock"));
     queue_initialized = true;
 
     __wt_atomic_store_bool(&conn->layered_drain_data.running, true);

@@ -1042,6 +1042,8 @@ struct __wt_connection_impl {
     struct __wt_layered_drain_data {
         WT_THREAD_GROUP threads;
         WT_SPINLOCK queue_lock;
+        WT_SPINLOCK fix_prepared_lock; /* Serializes __layered_fix_prepared_transaction across
+                                          drain workers; see comment at the call site. */
         TAILQ_HEAD(__wt_layered_drain_qh, __wt_layered_drain_work_item) work_queue;
         bool running;
         uint32_t thread_count;
