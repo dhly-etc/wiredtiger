@@ -972,22 +972,39 @@ __layered_ingest_table_is_empty(WT_SESSION_IMPL *session, const char *ingest_uri
     *emptyp = false;
     cursor = NULL;
 
-    WT_RET(__wt_open_cursor(session, ingest_uri, NULL, NULL, &cursor));
-    /* Set WT_TXN_IGNORE_PREPARE so prepared updates don't cause WT_PREPARE_CONFLICT. */
-    F_SET(session->txn, WT_TXN_IGNORE_PREPARE);
-    WT_WITH_TXN_ISOLATION(session, WT_ISO_READ_UNCOMMITTED, ret = cursor->next(cursor));
-    F_CLR(session->txn, WT_TXN_IGNORE_PREPARE);
-    /*
-     * WT_ROLLBACK here means the cursor hit a modify update that read-uncommitted cannot
-     * reconstruct (WT_MODIFY_READ_UNCOMMITTED). A record exists; the table is not empty.
-     */
-    if (ret == WT_ROLLBACK) {
+    if (F_ISSET(S2C(session), WT_CONN_PRESERVE_PREPARED)) {
+        /*
+         * With preserve_prepared, a rolled-back prepared insert on the ingest btree leaves the key
+         * with an [aborted-prepared-upd -> globally-visible-tombstone] chain. A regular read-
+         * uncommitted cursor walks past the aborted update and sees the tombstone, so it reports
+         * the key as deleted and the ingest btree as empty -- but the corresponding claim-prepared
+         * cell on the stable btree is still unresolved, and only the drain main loop (which
+         * iterates a version cursor with show_prepared_rollback=true) will resolve it. We can't
+         * cheaply distinguish "ingest btree truly empty" from "ingest btree contains only rolled-
+         * back prepares" without running roughly the same scan the drain itself would do, so just
+         * treat the table as non-empty whenever preserve_prepared is enabled. The cost is running
+         * the drain main loop once over a genuinely empty btree -- a single version-cursor next()
+         * returning WT_NOTFOUND.
+         */
         *emptyp = false;
-        ret = 0;
-    } else if (ret != 0 && ret != WT_NOTFOUND)
-        WT_ERR(ret);
-    else
-        *emptyp = (ret == WT_NOTFOUND);
+    } else {
+        WT_RET(__wt_open_cursor(session, ingest_uri, NULL, NULL, &cursor));
+        /* Set WT_TXN_IGNORE_PREPARE so prepared updates don't cause WT_PREPARE_CONFLICT. */
+        F_SET(session->txn, WT_TXN_IGNORE_PREPARE);
+        WT_WITH_TXN_ISOLATION(session, WT_ISO_READ_UNCOMMITTED, ret = cursor->next(cursor));
+        F_CLR(session->txn, WT_TXN_IGNORE_PREPARE);
+        /*
+         * WT_ROLLBACK here means the cursor hit a modify update that read-uncommitted cannot
+         * reconstruct (WT_MODIFY_READ_UNCOMMITTED). A record exists; the table is not empty.
+         */
+        if (ret == WT_ROLLBACK) {
+            *emptyp = false;
+            ret = 0;
+        } else if (ret != 0 && ret != WT_NOTFOUND)
+            WT_ERR(ret);
+        else
+            *emptyp = (ret == WT_NOTFOUND);
+    }
     ret = 0;
 
 err:
