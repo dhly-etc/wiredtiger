@@ -466,7 +466,8 @@ __layered_find_resurrection_truncate(WT_SESSION_IMPL *session, WT_LAYERED_TABLE 
     ret = 0;
     __wt_readlock(session, &layered_table->truncate_lock);
     TAILQ_FOREACH (t, &layered_table->truncateqh, q) {
-        if (!t->committed)
+        /* Match the release-store at __wt_txn_truncate_commit. */
+        if (!__wt_atomic_load_bool_acquire(&t->committed))
             continue;
         /* Only consider truncates whose timestamp is strictly before the reinsert timestamp. */
         if (t->start_ts == WT_TS_NONE || t->start_ts >= cutoff_ts)
@@ -1086,6 +1087,7 @@ __layered_sample_ingest_keys(WT_SESSION_IMPL *session, const char *ingest_uri, u
     samples = NULL;
     split_keys = NULL;
     key_count = 0;
+    n_collected = 0;
     n_splits = 0;
     *split_keysp = NULL;
     *actual_splitsp = 0;
@@ -1109,8 +1111,17 @@ __layered_sample_ingest_keys(WT_SESSION_IMPL *session, const char *ingest_uri, u
           buf2, sizeof(buf2), "start_timestamp=%" PRIx64 "", last_checkpoint_timestamp));
     else
         buf2[0] = '\0';
+    /*
+     * Match the drain main loop's version-cursor configuration. timestamp_order=true keeps the
+     * iteration ordered, and show_prepared_rollback=true makes rolled-back prepared updates
+     * visible -- without it, an ingest btree whose keys are dominated by rolled-back prepares
+     * would be undercounted here, causing split points to cluster in the committed region and
+     * load to imbalance across workers.
+     */
     WT_ERR(__wt_snprintf(buf, sizeof(buf),
-      "debug=(dump_version=(enabled=true,raw_key_value=true,cross_key=true,%s))", buf2));
+      "debug=(dump_version=(enabled=true,raw_key_value=true,timestamp_order=true,cross_key=true,"
+      "show_prepared_rollback=%s,%s))",
+      F_ISSET(conn, WT_CONN_PRESERVE_PREPARED) ? "true" : "false", buf2));
     cfg[1] = buf;
 
     WT_ERR(__wt_scr_alloc(session, 0, &cur_key));
@@ -1184,7 +1195,8 @@ err:
     if (cursor != NULL)
         WT_TRET(cursor->close(cursor));
     if (samples != NULL) {
-        for (i = 0; i < num_samples; i++)
+        /* Only n_collected slots were populated; the tail slots are zeroed. */
+        for (i = 0; i < n_collected; i++)
             __wt_buf_free(session, &samples[i]);
         __wt_free(session, samples);
     }
@@ -1304,7 +1316,8 @@ __layered_apply_and_clear_truncates(WT_SESSION_IMPL *session, const char *layere
 
     __wt_readlock(session, &layered_table->truncate_lock);
     TAILQ_FOREACH (t, &layered_table->truncateqh, q) {
-        if (!__wt_atomic_load_bool_relaxed(&t->committed))
+        /* Match the release-store at __wt_txn_truncate_commit. */
+        if (!__wt_atomic_load_bool_acquire(&t->committed))
             continue;
         __wt_readunlock(session, &layered_table->truncate_lock);
         WT_TRET(__layered_apply_truncate_to_stable(session, t));
@@ -1545,6 +1558,10 @@ err:
      * table, including tables whose ingest btree was empty (and therefore skipped above). Keys that
      * only exist in stable — never written to the ingest btree — are not covered by ingest
      * tombstones; the explicit range truncate replay is the only path that stamps them deleted.
+     *
+     * This block runs unconditionally on the err: path: a drain worker failure sets
+     * WT_THREAD_PANIC_FAIL, which panics the connection before any reader can observe a partially-
+     * drained stable btree, so applying truncates here cannot widen the consistency window.
      */
     if (entries != NULL) {
         for (i = 0; i < table_count; i++) {

@@ -60,21 +60,21 @@ __prepared_discover_is_follower_stable_walk(WT_SESSION_IMPL *session, const char
 static int
 __prepared_discover_register_layered(WT_SESSION_IMPL *session, const char *stable_uri)
 {
-    WT_CURSOR *cursor;
-    WT_DECL_ITEM(layered_uri_buf);
-    WT_DECL_RET;
     static const char file_prefix[] = "file:";
     static const char stable_suffix[] = ".wt_stable";
     size_t prefix_len = strlen(file_prefix);
     const char *suffix_start;
+    WT_CURSOR *cursor;
+    WT_DECL_ITEM(layered_uri_buf);
+    WT_DECL_RET;
 
     cursor = NULL;
 
     /*
-     * stable_uri is "file:<name>.wt_stable" or "file:<name>.wt_stable/<checkpoint>"; locate the
-     * ".wt_stable" boundary and derive "layered:<name>". The metadata-discovery caller never
-     * appends a checkpoint suffix when the manager-registration path matters, but tolerate it
-     * defensively.
+     * The follower stable walk is always entered with a checkpoint-suffixed URI of the form
+     * "file:<name>.wt_stable/<checkpoint>" (see __wt_prepared_discover_filter_apply_handles, which
+     * appends the checkpoint name before calling __prepared_discover_walk_one_tree). Locate the
+     * ".wt_stable" boundary -- ignoring everything after it -- and derive "layered:<name>".
      */
     if (!WT_PREFIX_MATCH(stable_uri, file_prefix))
         return (0);
