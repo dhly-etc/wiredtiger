@@ -126,7 +126,12 @@ retry:
      * prepared update, leaving an orphaned prepared value on the disk image. The tombstone keeps
      * the post-rollback state well-defined (the key never existed).
      */
-    if (cbt->compare != 0 && last_upd->txnid == WT_TXN_ABORTED) {
+    if (cbt->compare != 0 && last_upd->txnid == WT_TXN_ABORTED && last_upd->next == NULL) {
+        /*
+         * Don't reallocate on a WT_RESTART-driven retry: cbt->compare and last_upd->txnid are
+         * stable across retries for the same key, so without the next-NULL guard each retry would
+         * allocate a fresh tombstone and orphan the previous one.
+         */
         WT_ASSERT(session, last_upd->prepared_id != WT_PREPARED_ID_NONE);
         WT_UPDATE *tombstone;
         WT_ERR(__wt_upd_alloc_tombstone(session, &tombstone, NULL));
