@@ -1068,6 +1068,7 @@ __layered_sample_ingest_keys(WT_SESSION_IMPL *session, const char *ingest_uri, u
     samples = NULL;
     split_keys = NULL;
     key_count = 0;
+    n_splits = 0;
     *split_keysp = NULL;
     *actual_splitsp = 0;
     *sampled_keysp = 0;
@@ -1170,7 +1171,12 @@ err:
         __wt_free(session, samples);
     }
     if (split_keys != NULL) {
-        for (i = 0; i < max_splits; i++)
+        /*
+         * split_keys is allocated with n_splits elements (line 1150), which may be smaller than
+         * max_splits when the drainable key count is sparse. Iterating up to max_splits would walk
+         * past the allocation.
+         */
+        for (i = 0; i < n_splits; i++)
             __wt_buf_free(session, &split_keys[i]);
         __wt_free(session, split_keys);
     }
